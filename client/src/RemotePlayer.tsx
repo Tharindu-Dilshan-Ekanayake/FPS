@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from "react";
 import { useFrame } from "@react-three/fiber";
 import { useGLTF, useAnimations } from "@react-three/drei";
 import { RigidBody, RapierRigidBody, CapsuleCollider } from "@react-three/rapier";
@@ -14,13 +14,20 @@ const ENEMY_URL = "/enime.glb"; // already preloaded by Bot.tsx
 // with how Player (App.tsx) reports its own camera position.
 const TARGET_HEIGHT = 0.5;
 
+// A hit above this fraction of the character's height (measured from the
+// feet) counts as a headshot. There's no separate head hitbox/bone lookup
+// here — this rig only has one capsule collider, and the raycast already
+// hits the visible mesh directly, so approximating "head" as the top slice
+// of the model is both cheap and accurate enough for this game's scale.
+const HEADSHOT_HEIGHT_FRACTION = 0.8;
+
 export interface RemotePlayerHandle {
   updateState: (position: Vec3, quaternion: Quat, moving: boolean) => void;
 }
 
 interface RemotePlayerProps {
   health: number;
-  onHit: () => void;
+  onHit: (headshot: boolean) => void;
 }
 
 export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({ health, onHit }, ref) => {
@@ -81,6 +88,24 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
     },
   }));
 
+  // Decide headshot vs. body shot from where the shot actually landed,
+  // relative to this avatar's current feet position (the RigidBody's own
+  // translation is the capsule center, not the feet — see the capsule
+  // math above for why TARGET_HEIGHT/2 recovers ground level).
+  const handleHitPoint = useCallback(
+    (hitPoint: THREE.Vector3) => {
+      const body = rigidBodyRef.current;
+      if (!body) {
+        onHit(false);
+        return;
+      }
+      const feetY = body.translation().y - TARGET_HEIGHT / 2;
+      const headshot = hitPoint.y - feetY >= TARGET_HEIGHT * HEADSHOT_HEIGHT_FRACTION;
+      onHit(headshot);
+    },
+    [onHit]
+  );
+
   const playAnim = (name: string, fade = 0.25) => {
     if (!actions || currentAnim.current === name) return;
     const next = actions[name];
@@ -119,6 +144,13 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
     }
     deathTriggered.current = false;
     deathProgress.current = 0;
+    // Undo the collapse pose on respawn — nothing else in this component
+    // ever touches rotation.x, and the position.y set here is cheap enough
+    // to just re-assert every frame rather than track a one-shot reset.
+    if (visualRef.current) {
+      visualRef.current.rotation.x = 0;
+      visualRef.current.position.y = modelOffsetY;
+    }
 
     // Smoothly chase the latest network sample rather than teleporting to
     // it — damp() gives a springy-but-stable follow that hides the gap
@@ -157,7 +189,7 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
       position={[0, 2, 0]}
       enabledRotations={[false, false, false]}
       canSleep={false}
-      userData={{ isTarget: true, isBot: true, onHit }}
+      userData={{ isTarget: true, isBot: true, onHit: handleHitPoint }}
     >
       <CapsuleCollider args={[capsuleHalfHeight, capsuleRadius]} friction={0} restitution={0} />
       <group ref={visualRef} position={[0, modelOffsetY, 0]}>

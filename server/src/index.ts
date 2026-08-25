@@ -1,19 +1,32 @@
 import { createServer } from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
 import type { ClientMessage, ServerMessage } from "./protocol.js";
+import { Room, type RoomSettings } from "./room.js";
 
 const PORT = Number(process.env.PORT) || 8787;
 
 interface Player {
   id: number;
   socket: WebSocket;
-  opponent: Player | null;
+  opponent: Player | null; // lightweight relay target for state/shoot only
+  room: Room | null; // authoritative combat/timer/win-condition state
   isAlive: boolean;
+}
+
+// A player waiting under a private room code, plus the kill/time limits
+// they asked for. Only code-based matches honor custom settings — two
+// friends sharing a code explicitly agreed to them, whereas an anonymous
+// quick-match stranger shouldn't be able to impose e.g. a 1-kill match on
+// whoever they get paired with (Room clamps these either way, but this is
+// the "do we even look at the client's request" gate).
+interface WaitingInCode {
+  player: Player;
+  settings: RoomSettings;
 }
 
 let nextPlayerId = 1;
 const queue: Player[] = []; // anonymous quick-match
-const codeRooms = new Map<string, Player>(); // roomCode -> player waiting in it
+const codeRooms = new Map<string, WaitingInCode>(); // roomCode -> player waiting in it
 const players = new Map<WebSocket, Player>();
 
 function send(socket: WebSocket, message: ServerMessage) {
@@ -25,21 +38,37 @@ function removeFromWaiting(player: Player) {
   const idx = queue.indexOf(player);
   if (idx !== -1) queue.splice(idx, 1);
   for (const [code, waiting] of codeRooms) {
-    if (waiting === player) codeRooms.delete(code);
+    if (waiting.player === player) codeRooms.delete(code);
   }
 }
 
-function pairUp(player: Player, waiting: Player) {
+function pairUp(player: Player, waiting: Player, settings: RoomSettings = {}) {
   player.opponent = waiting;
   waiting.opponent = player;
+
   // Deterministic by id so both clients agree on who spawns where.
   const playerIsOne = player.id < waiting.id;
-  send(player.socket, { type: "matched", isPlayerOne: playerIsOne });
-  send(waiting.socket, { type: "matched", isPlayerOne: !playerIsOne });
+  const [one, two] = playerIsOne ? [player, waiting] : [waiting, player];
+
+  const room = new Room(
+    { id: one.id, socket: one.socket },
+    { id: two.id, socket: two.socket },
+    () => {
+      // Match over (any reason) — clear both sides so either can queue for
+      // a new match/rematch without being treated as "still in a match".
+      player.opponent = null;
+      player.room = null;
+      waiting.opponent = null;
+      waiting.room = null;
+    },
+    settings
+  );
+  player.room = room;
+  waiting.room = room;
 }
 
-function handleFindMatch(player: Player, roomCode?: string) {
-  if (player.opponent) return; // already in a match
+function handleFindMatch(player: Player, roomCode?: string, killLimit?: number, timeLimitSeconds?: number) {
+  if (player.room) return; // already in an active match
   removeFromWaiting(player);
 
   const code = roomCode?.trim().toUpperCase();
@@ -48,11 +77,14 @@ function handleFindMatch(player: Player, roomCode?: string) {
     const waiting = codeRooms.get(code);
     // A dead/expired entry left under this code shouldn't block a fresh
     // pairing — same reasoning as the quick-match queue below.
-    if (waiting && waiting.socket.readyState === WebSocket.OPEN && waiting !== player) {
+    if (waiting && waiting.player.socket.readyState === WebSocket.OPEN && waiting.player !== player) {
       codeRooms.delete(code);
-      pairUp(player, waiting);
+      // The player who was already WAITING in this code chose the match
+      // settings — the joiner's own selection (if any) is ignored, same
+      // as arriving at a friend's already-configured lobby.
+      pairUp(player, waiting.player, waiting.settings);
     } else {
-      codeRooms.set(code, player);
+      codeRooms.set(code, { player, settings: { killLimit, timeLimitSeconds } });
       send(player.socket, { type: "queued", roomCode: code });
     }
     return;
@@ -73,17 +105,15 @@ function handleFindMatch(player: Player, roomCode?: string) {
     return;
   }
 
+  // Anonymous quick-match always uses defaults — see WaitingInCode comment.
   pairUp(player, waiting);
 }
 
 function handleLeave(player: Player) {
   removeFromWaiting(player);
-  const opponent = player.opponent;
-  if (opponent) {
-    opponent.opponent = null;
-    send(opponent.socket, { type: "opponent_left" });
-  }
+  player.room?.handleDisconnect(player.id);
   player.opponent = null;
+  player.room = null;
 }
 
 function handleMessage(player: Player, raw: string) {
@@ -96,7 +126,7 @@ function handleMessage(player: Player, raw: string) {
 
   switch (msg.type) {
     case "find_match":
-      handleFindMatch(player, msg.roomCode);
+      handleFindMatch(player, msg.roomCode, msg.killLimit, msg.timeLimitSeconds);
       break;
     case "state": {
       const opponent = player.opponent;
@@ -115,18 +145,9 @@ function handleMessage(player: Player, raw: string) {
       send(opponent.socket, { type: "opponent_shot", from: msg.from, to: msg.to });
       break;
     }
-    case "hit": {
-      const opponent = player.opponent;
-      if (!opponent) return;
-      send(opponent.socket, { type: "damage" });
+    case "hit":
+      player.room?.registerHit(player.id, msg.headshot);
       break;
-    }
-    case "health": {
-      const opponent = player.opponent;
-      if (!opponent) return;
-      send(opponent.socket, { type: "opponent_health", health: msg.health });
-      break;
-    }
     case "leave":
       handleLeave(player);
       break;
@@ -141,7 +162,7 @@ const httpServer = createServer((_req, res) => {
 const wss = new WebSocketServer({ server: httpServer });
 
 wss.on("connection", (socket) => {
-  const player: Player = { id: nextPlayerId++, socket, opponent: null, isAlive: true };
+  const player: Player = { id: nextPlayerId++, socket, opponent: null, room: null, isAlive: true };
   players.set(socket, player);
 
   socket.on("message", (data) => handleMessage(player, data.toString()));

@@ -2,4 +2,4 @@
 // opponent's avatar) — broken out to a standalone module so RemotePlayer
 // can reuse the exact eye-height-to-capsule-center relationship without
 // creating a circular import with App.tsx.
-export const EYE_HEIGHT = 0.34;
+export const EYE_HEIGHT = 0.40;

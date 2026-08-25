@@ -19,9 +19,18 @@ const WEAPON_BOB_AMOUNT_X = 0.012; // side-to-side sway per stride
 const WEAPON_BOB_AMOUNT_Y = 0.011; // downward dip per footfall
 const IDLE_SWAY_AMOUNT_X = 0.0035; // slow breathing sway when standing still
 const IDLE_SWAY_AMOUNT_Y = 0.0025;
-const RECOIL_PITCH_KICK = 0.013; // camera pitch-up per shot, in radians
-const RECOIL_PITCH_MAX = 0.11; // clamp so sustained full-auto can't spin the view away
-const RECOIL_PITCH_RECOVERY = 11; // higher = snappier return to aim
+// Softer/snappier than the original tuning — the old values (0.013 kick,
+// 0.11 max, recovery 11) made sustained fire feel like the view got stuck
+// climbing and slow to come back down. Recovery here is the damp() rate,
+// so ~1.6x faster settle time for the same kick.
+const RECOIL_PITCH_KICK = 0.009; // camera pitch-up per shot, in radians
+const RECOIL_PITCH_MAX = 0.075; // clamp so sustained full-auto can't spin the view away
+const RECOIL_PITCH_RECOVERY = 18; // higher = snappier return to aim
+// Local-space position of the barrel tip inside modelRef (scale 0.6) —
+// must match the muzzle-flash <group> below so the tracer/hit-scan visibly
+// originates from the actual gun tip instead of an eyeballed camera-space
+// guess.
+const MUZZLE_TIP_LOCAL: [number, number, number] = [-0.12, 1.18, 1.68];
 
 export interface WeaponProps {
   isMoving?: boolean;
@@ -51,6 +60,10 @@ function WeaponModel({
   const weaponGroupRef = useRef<THREE.Group>(null);
   // The inner group is the model root — needed for useAnimations
   const modelRef = useRef<THREE.Group>(null);
+  // Always-mounted (unlike the muzzle-flash visual, which only exists
+  // while flashing) anchor at the barrel tip, so doFire can read its exact
+  // world position for the tracer/hit-scan origin — see MUZZLE_TIP_LOCAL.
+  const muzzleTipRef = useRef<THREE.Group>(null);
 
   const recoilRef = useRef(0);
   // Remaining upward camera-pitch kick still to be eased back out — see the
@@ -215,13 +228,15 @@ function WeaponModel({
       actions["Arms_Fire"].reset().setLoop(THREE.LoopOnce, 1).play();
     }
 
-    // Muzzle world position — small offset forward-right from camera
-    if (onShoot && weaponGroupRef.current) {
-      const muzzleLocal = new THREE.Vector3(0.08, -0.05, -0.55);
-      const muzzleWorld = muzzleLocal.clone();
-      // Will be updated in next useFrame, approximate here with camera data
-      weaponGroupRef.current.localToWorld(muzzleWorld);
-      onShoot(muzzleWorld);
+    // Muzzle world position — read straight off the barrel-tip anchor
+    // (same local spot the muzzle-flash visual renders at) so the
+    // tracer/hit-scan visibly starts at the gun, not an approximate
+    // camera-space offset. updateWorldMatrix recomputes the whole
+    // camera->weaponGroup->model->tip chain right now rather than waiting
+    // for next frame's render, since doFire runs from a mousedown handler.
+    if (onShoot && muzzleTipRef.current) {
+      muzzleTipRef.current.updateWorldMatrix(true, false);
+      onShoot(muzzleTipRef.current.getWorldPosition(new THREE.Vector3()));
     }
   };
 
@@ -366,11 +381,12 @@ function WeaponModel({
       <group ref={modelRef} position={[-0, -0.79, 0]} rotation={[-0.01, -0.011, 0]} scale={0.6}>
         <primitive object={clonedScene} />
 
+        {/* Always-present barrel-tip anchor — see muzzleTipRef in doFire. */}
+        <group ref={muzzleTipRef} position={MUZZLE_TIP_LOCAL} />
+
         {/* 3-D Muzzle Flash at barrel tip */}
         {muzzleFlash && (
-          <group
-            position={[-0.12, 1.18, 1.68]}  // local model space — barrel tip
-          >
+          <group position={MUZZLE_TIP_LOCAL}>
             <mesh renderOrder={1000}>
               <dodecahedronGeometry args={[0.22, 0]} />
               <meshBasicMaterial color="#fef08a" depthTest={false} />
