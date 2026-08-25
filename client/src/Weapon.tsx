@@ -1,5 +1,5 @@
 import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { useFrame } from "@react-three/fiber";
+import { useFrame, useThree } from "@react-three/fiber";
 import { useGLTF, useAnimations } from "@react-three/drei";
 import * as THREE from "three";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
@@ -12,6 +12,16 @@ useGLTF.preload(WEAPON_URL);
 // so they illuminate the gun/hands without spilling onto nearby world
 // geometry (the map is scaled tiny, so walls can be very close to camera).
 const WEAPON_LIGHT_LAYER = 1;
+
+// ── Viewmodel feel tuning ───────────────────────────────────────────────────
+const WEAPON_BOB_SPEED = 9.5; // walking bob cycle rate
+const WEAPON_BOB_AMOUNT_X = 0.012; // side-to-side sway per stride
+const WEAPON_BOB_AMOUNT_Y = 0.011; // downward dip per footfall
+const IDLE_SWAY_AMOUNT_X = 0.0035; // slow breathing sway when standing still
+const IDLE_SWAY_AMOUNT_Y = 0.0025;
+const RECOIL_PITCH_KICK = 0.013; // camera pitch-up per shot, in radians
+const RECOIL_PITCH_MAX = 0.11; // clamp so sustained full-auto can't spin the view away
+const RECOIL_PITCH_RECOVERY = 11; // higher = snappier return to aim
 
 export interface WeaponProps {
   isMoving?: boolean;
@@ -35,6 +45,7 @@ function WeaponModel({
   setIsReloading,
 }: WeaponProps) {
   const { scene, animations } = useGLTF(WEAPON_URL);
+  const { camera } = useThree();
 
   // The outer group follows the camera in world space every frame
   const weaponGroupRef = useRef<THREE.Group>(null);
@@ -42,6 +53,14 @@ function WeaponModel({
   const modelRef = useRef<THREE.Group>(null);
 
   const recoilRef = useRef(0);
+  // Remaining upward camera-pitch kick still to be eased back out — see the
+  // recoil recovery step in the useFrame below and the kick applied in
+  // doFire. Distinct from recoilRef above, which only nudges the
+  // viewmodel's own local position/rotation, not the camera itself.
+  const recoilPitchRef = useRef(0);
+  // 0 → 1 blend between "idle breathing sway" and "walking bob", eased so
+  // starting/stopping movement doesn't snap the viewmodel.
+  const bobFadeRef = useRef(0);
   const [muzzleFlash, setMuzzleFlash] = useState(false);
   const flashTimer = useRef<number | null>(null);
   const lastShotTime = useRef(0);
@@ -176,6 +195,16 @@ function WeaponModel({
 
     recoilRef.current = 1;
 
+    // Real camera-pitch recoil kick — pushes the view (and next shot's aim)
+    // up, then eases back down over subsequent frames below. Safe against
+    // PointerLockControls: it re-derives its internal euler from the
+    // camera's current quaternion on every mousemove rather than caching
+    // its own absolute rotation, so this local rotateX composes cleanly
+    // with mouse-look instead of fighting it (verified against
+    // three-stdlib's PointerLockControls source).
+    recoilPitchRef.current = Math.min(recoilPitchRef.current + RECOIL_PITCH_KICK, RECOIL_PITCH_MAX);
+    camera.rotateX(RECOIL_PITCH_KICK);
+
     // Muzzle flash
     setMuzzleFlash(true);
     if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
@@ -243,6 +272,17 @@ function WeaponModel({
     const group = weaponGroupRef.current;
     if (!group) return;
 
+    // Ease the recoil-kicked camera pitch back toward where the player was
+    // actually aiming — see the kick applied in doFire. Undoing a fraction
+    // of the *remaining* kick each frame (rather than chasing an absolute
+    // target) means it composes correctly no matter how the player's own
+    // mouse-look moves the camera while it's recovering.
+    if (recoilPitchRef.current > 0.00005) {
+      const nextPitch = THREE.MathUtils.damp(recoilPitchRef.current, 0, RECOIL_PITCH_RECOVERY, delta);
+      state.camera.rotateX(-(recoilPitchRef.current - nextPitch));
+      recoilPitchRef.current = nextPitch;
+    }
+
     // Damp recoil back to zero
     recoilRef.current = THREE.MathUtils.damp(recoilRef.current, 0, 18, delta);
     const r = recoilRef.current;
@@ -256,6 +296,19 @@ function WeaponModel({
     const sx = swayCurrent.current.x;
     const sy = swayCurrent.current.y;
 
+    // Walking bob (footstep-synced weight) cross-fades with a slow idle
+    // breathing sway, so the gun never looks perfectly bolted to the
+    // screen even when standing still, and doesn't pop when movement
+    // starts/stops.
+    bobFadeRef.current = THREE.MathUtils.damp(bobFadeRef.current, isMoving ? 1 : 0, 6, delta);
+    const bobFade = bobFadeRef.current;
+    const bobPhase = state.clock.elapsedTime * WEAPON_BOB_SPEED;
+    const bobX = Math.sin(bobPhase) * WEAPON_BOB_AMOUNT_X * bobFade;
+    const bobY = Math.abs(Math.sin(bobPhase)) * WEAPON_BOB_AMOUNT_Y * bobFade;
+    const idleFade = 1 - bobFade;
+    const idleX = Math.sin(state.clock.elapsedTime * 0.8) * IDLE_SWAY_AMOUNT_X * idleFade;
+    const idleY = Math.sin(state.clock.elapsedTime * 0.65) * IDLE_SWAY_AMOUNT_Y * idleFade;
+
     group.position.copy(state.camera.position);
     group.quaternion.copy(state.camera.quaternion);
 
@@ -267,19 +320,21 @@ function WeaponModel({
     // matching its close-up framing here warped the support hand out of a
     // natural pose (and partly out of frame).
     group.position.add(localOffsetRef.set(
-      0.015 + sx * 0.6,
-      -0.36 - r * 0.02 + sy * 0.6,
+      0.015 + sx * 0.6 + bobX + idleX,
+      -0.36 - r * 0.02 + sy * 0.6 - bobY + idleY,
       -0.85 + r * 0.06,
     ).applyQuaternion(state.camera.quaternion));
-    group.rotateY(Math.PI + sx * 0.35);
+    group.rotateY(Math.PI + sx * 0.35 + bobX * 0.4);
 
     // Recoil tilt on the group
     group.rotation.x -= r * 0.08 - sy * 0.3;
   });
 
   return (
-    // renderOrder on the group so Three.js sorts it last
-    <group ref={weaponGroupRef} renderOrder={999}>
+    // renderOrder on the group so Three.js sorts it last. Named so
+    // RaycastShooter (App.tsx) can walk up from any hit mesh and recognize
+    // it as part of the viewmodel rig, excluding it from shot raycasts.
+    <group ref={weaponGroupRef} name="weaponGroupRef" renderOrder={999}>
       {/* Dedicated viewmodel fill light — travels with the camera so the
           gun always reads with crisp, flattering highlights regardless of
           which way the world's sun is facing. Same technique real FPS

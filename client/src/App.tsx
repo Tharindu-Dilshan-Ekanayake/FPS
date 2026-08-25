@@ -13,10 +13,14 @@ import { DIFFICULTY_PRESETS, type Difficulty } from "./difficulty";
 import {
   formatScoreLimit,
   formatTimeLimit,
+  formatMatchEndReason,
+  defaultKillLimit,
+  DEFAULT_TIME_LIMIT,
   SCORE_LIMIT_OPTIONS,
   TIME_LIMIT_OPTIONS,
   type CombatantRegistry,
   type GameMode,
+  type MatchEndReason,
 } from "./match";
 import {
   playHitSound,
@@ -27,6 +31,12 @@ import {
   startAmbientAmbience,
   stopAmbientAmbience,
 } from "./audio";
+import { GraphicsSettingsPanel } from "./Settings";
+import { loadGraphicsSettings, saveGraphicsSettings, type GraphicsSettings } from "./graphicsSettings";
+import { Compass, CompassDriver, type CompassHandle } from "./Compass";
+import { EYE_HEIGHT } from "./playerConstants";
+import { RemotePlayer, type RemotePlayerHandle } from "./RemotePlayer";
+import { DuelConnection, type DuelStatus } from "./network";
 
 type GameState = "menu" | "playing" | "won" | "lost" | "draw";
 
@@ -36,7 +46,6 @@ type GameState = "menu" | "playing" | "won" | "lost" | "draw";
 const MOVE_SPEED = 4.5;
 const JUMP_FORCE = 5.5;
 const GRAVITY = -18;
-const EYE_HEIGHT = 0.34;
 const CROUCH_HEIGHT = EYE_HEIGHT * 0.6;
 const PRONE_HEIGHT = EYE_HEIGHT * 0.22;
 const CROUCH_SPEED_MULT = 0.55;
@@ -61,6 +70,17 @@ const ALLY_SPAWN_POINTS: [number, number, number][] = [
 ];
 const MAX_TEAM_SIZE = ALLY_SPAWN_POINTS.length + 1; // + the player
 
+// 1v1 duel arena. Chosen by actually ray-casting candidate lanes against
+// the map's collision geometry (not eyeballed) — the x=0 corridor down
+// the map's center looks open in screenshots but is blocked by props
+// around z=-3.2 and z=0, and the original z=+6/-6 choice sat right next
+// to a large barrel/tire stack. x=-4 is verified clear from z=7 to z=-7
+// at gameplay height (0.3-0.8 units), with margin on both sides.
+const DUEL_SPAWN_POINTS: [[number, number, number], [number, number, number]] = [
+  [-4, 2, 6],
+  [-4, 2, -6],
+];
+
 const movementKeys = new Set([
   "KeyW", "KeyA", "KeyS", "KeyD",
   "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight",
@@ -71,15 +91,25 @@ interface PlayerProps {
   onMoveStateChange: (moving: boolean) => void;
   registry: CombatantRegistry;
   onDamageTaken: (damage: number) => void;
+  spawnPosition?: [number, number, number];
+  // Duel mode only — the default camera facing (-Z) is fine for one spawn
+  // but leaves the other player facing away from their opponent, so this
+  // sets the initial look direction once on mount.
+  spawnYaw?: number;
+  // Duel mode only — throttled (not every frame) so the network isn't fed
+  // 60 updates/sec for something a 15-20Hz tick already reads smoothly
+  // once RemotePlayer interpolates between samples.
+  onNetworkTick?: (position: [number, number, number], quaternion: [number, number, number, number], moving: boolean) => void;
 }
 
 // ──────────────────────────────────────────────────────
 //  PLAYER – Rapier KinematicCharacterController
 // ──────────────────────────────────────────────────────
-function Player({ onMoveStateChange, registry, onDamageTaken }: PlayerProps) {
+function Player({ onMoveStateChange, registry, onDamageTaken, spawnPosition = [0, 1.5, 0], spawnYaw, onNetworkTick }: PlayerProps) {
   const rigidBodyRef = useRef<RapierRigidBody>(null);
   const pressedKeys = useRef(new Set<string>());
   const { world } = useRapier();
+  const { camera } = useThree();
   const cc = useRef<ReturnType<typeof world.createCharacterController> | null>(null);
   const yVelocity = useRef(0);
   const isMovingRef = useRef(false);
@@ -90,6 +120,13 @@ function Player({ onMoveStateChange, registry, onDamageTaken }: PlayerProps) {
   const eyeHeightRef = useRef(EYE_HEIGHT);
   const crouchKeyHeldRef = useRef(false);
   const proneKeyHeldRef = useRef(false);
+  // Scratch vectors reused every frame instead of `new THREE.Vector3(...)`
+  // — this runs once per player (not per-bot), so it's a smaller win than
+  // the same fix in Bot.tsx, but free to avoid all the same.
+  const camDirVec = useRef(new THREE.Vector3());
+  const camRightVec = useRef(new THREE.Vector3());
+  const horizontalVec = useRef(new THREE.Vector3());
+  const netTimerRef = useRef(0);
 
   // Register as a combat target so enemy bots (and, in TDM, ally bots avoiding
   // friendly fire) can find the player through the shared registry.
@@ -142,6 +179,16 @@ function Player({ onMoveStateChange, registry, onDamageTaken }: PlayerProps) {
     };
   }, []);
 
+  // Duel mode: face the opponent's spawn instead of always defaulting to
+  // the scene's -Z. Set once on mount only — PointerLockControls re-derives
+  // its own tracking from the camera's current quaternion on every
+  // mousemove (never caches an absolute value), so this composes safely
+  // with mouse-look instead of fighting it.
+  useEffect(() => {
+    if (spawnYaw !== undefined) camera.rotation.set(0, spawnYaw, 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useFrame((state, delta) => {
     if (!rigidBodyRef.current || !cc.current) return;
 
@@ -180,16 +227,16 @@ function Player({ onMoveStateChange, registry, onDamageTaken }: PlayerProps) {
     }
 
     // Horizontal direction relative to camera
-    const camDir = new THREE.Vector3();
+    const camDir = camDirVec.current;
     state.camera.getWorldDirection(camDir);
     camDir.y = 0;
     camDir.normalize();
 
-    const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(state.camera.quaternion);
+    const camRight = camRightVec.current.set(1, 0, 0).applyQuaternion(state.camera.quaternion);
     camRight.y = 0;
     camRight.normalize();
 
-    const horizontal = new THREE.Vector3();
+    const horizontal = horizontalVec.current.set(0, 0, 0);
     if (fwd) horizontal.add(camDir);
     if (bwd) horizontal.sub(camDir);
     if (rgt) horizontal.add(camRight);
@@ -236,6 +283,21 @@ function Player({ onMoveStateChange, registry, onDamageTaken }: PlayerProps) {
     const playerEntry = registry.get("player");
     if (playerEntry) playerEntry.position.copy(state.camera.position);
 
+    // Duel mode: broadcast this player's camera pose to the opponent.
+    if (onNetworkTick) {
+      netTimerRef.current -= delta;
+      if (netTimerRef.current <= 0) {
+        netTimerRef.current = 0.05; // ~20Hz
+        const camPos = state.camera.position;
+        const camQuat = state.camera.quaternion;
+        onNetworkTick(
+          [camPos.x, camPos.y, camPos.z],
+          [camQuat.x, camQuat.y, camQuat.z, camQuat.w],
+          currentlyMoving
+        );
+      }
+    }
+
     // Footsteps, timed to the bob cycle (slower and quieter while crouched/prone)
     if (currentlyMoving && grounded) {
       stepTimerRef.current += delta;
@@ -254,7 +316,7 @@ function Player({ onMoveStateChange, registry, onDamageTaken }: PlayerProps) {
       ref={rigidBodyRef}
       type="kinematicPosition"
       colliders={false}
-      position={[0, 1.5, 0]}
+      position={spawnPosition}
       enabledRotations={[false, false, false]}
       canSleep={false}
     >
@@ -342,13 +404,38 @@ interface RaycastShooterProps {
   onRegisterShot: (fn: (muzzlePos: THREE.Vector3) => void) => void;
   bulletEffectsRef: React.RefObject<BulletEffectsHandle | null>;
   onTargetHit: () => void;
+  // Duel mode only — lets the opponent see this shot's tracer too.
+  onShotFired?: (from: THREE.Vector3, to: THREE.Vector3) => void;
 }
 
-function RaycastShooter({ onRegisterShot, bulletEffectsRef, onTargetHit }: RaycastShooterProps) {
+// Walks up from a mesh to see if it hangs off the first-person weapon rig
+// (named "weaponGroupRef" — see Weapon.tsx), so shots never hit the player's
+// own gun/hands.
+function isWeaponDescendant(obj: THREE.Object3D): boolean {
+  let cur: THREE.Object3D | null = obj;
+  while (cur) {
+    if (cur.name === "weaponGroupRef") return true;
+    cur = cur.parent;
+  }
+  return false;
+}
+
+function RaycastShooter({ onRegisterShot, bulletEffectsRef, onTargetHit, onShotFired }: RaycastShooterProps) {
   const { scene } = useThree();
   const store = useStore();
   const raycaster = useRef(new THREE.Raycaster());
   const baseFov = useRef((store.getState().camera as THREE.PerspectiveCamera).fov);
+  const centerNdc = useRef(new THREE.Vector2(0, 0));
+  const farPointVec = useRef(new THREE.Vector3());
+
+  // Shootable meshes are collected by walking the whole scene graph, which
+  // is too expensive to redo on every single shot (a full-auto spray fires
+  // ~9x/sec) — it was previously the single biggest cause of stutter while
+  // firing. The map/bots/targets barely change shape mid-match, so a cache
+  // refreshed a couple times a second is indistinguishable in gameplay
+  // terms but removes that per-shot spike entirely.
+  const shootableCache = useRef<THREE.Object3D[]>([]);
+  const cacheRefreshTimer = useRef(0);
 
   // Tiny FOV "punch" per shot, eased back every frame — cheap recoil feel
   // that can't fight PointerLockControls since it never touches rotation.
@@ -361,6 +448,18 @@ function RaycastShooter({ onRegisterShot, bulletEffectsRef, onTargetHit }: Rayca
       cam.fov = THREE.MathUtils.damp(cam.fov, baseFov.current, 10, delta);
       cam.updateProjectionMatrix();
     }
+
+    cacheRefreshTimer.current -= delta;
+    if (cacheRefreshTimer.current <= 0) {
+      cacheRefreshTimer.current = 0.5;
+      const list: THREE.Object3D[] = [];
+      scene.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh && !isWeaponDescendant(child)) {
+          list.push(child);
+        }
+      });
+      shootableCache.current = list;
+    }
   });
 
   const shootRay = useCallback(
@@ -370,17 +469,9 @@ function RaycastShooter({ onRegisterShot, bulletEffectsRef, onTargetHit }: Rayca
       cam.fov = Math.min(cam.fov + 1.4, baseFov.current + 2.5);
       cam.updateProjectionMatrix();
 
-      raycaster.current.setFromCamera(new THREE.Vector2(0, 0), cam);
+      raycaster.current.setFromCamera(centerNdc.current, cam);
 
-      // Collect all meshes in the scene to test against
-      const shootableObjects: THREE.Object3D[] = [];
-      scene.traverse((child) => {
-        if ((child as THREE.Mesh).isMesh && child.parent?.name !== "weaponGroupRef") {
-          shootableObjects.push(child);
-        }
-      });
-
-      const intersects = raycaster.current.intersectObjects(shootableObjects, false);
+      const intersects = raycaster.current.intersectObjects(shootableCache.current, false);
 
       if (intersects.length > 0) {
         const hit = intersects[0];
@@ -388,6 +479,7 @@ function RaycastShooter({ onRegisterShot, bulletEffectsRef, onTargetHit }: Rayca
         const hitNormal = hit.face ? hit.face.normal.clone().applyQuaternion(hit.object.quaternion) : new THREE.Vector3(0, 1, 0);
 
         bulletEffectsRef.current?.addShot(muzzlePos, hitPoint, hitNormal);
+        onShotFired?.(muzzlePos, hitPoint);
 
         // Check if target was hit
         let currentObj: THREE.Object3D | null = hit.object;
@@ -402,12 +494,12 @@ function RaycastShooter({ onRegisterShot, bulletEffectsRef, onTargetHit }: Rayca
         }
       } else {
         // Did not hit any object; shoot ray far forward
-        const farPoint = new THREE.Vector3();
-        raycaster.current.ray.at(100, farPoint);
+        const farPoint = raycaster.current.ray.at(100, farPointVec.current);
         bulletEffectsRef.current?.addShot(muzzlePos, farPoint);
+        onShotFired?.(muzzlePos, farPoint);
       }
     },
-    [scene, store, bulletEffectsRef, onTargetHit]
+    [store, bulletEffectsRef, onTargetHit, onShotFired]
   );
 
   useEffect(() => {
@@ -422,7 +514,7 @@ function RaycastShooter({ onRegisterShot, bulletEffectsRef, onTargetHit }: Rayca
 // ──────────────────────────────────────────────────────
 const SUN_POSITION: [number, number, number] = [60, 55, 35];
 
-function Environment() {
+function Environment({ shadowsEnabled }: { shadowsEnabled: boolean }) {
   return (
     <>
       <color attach="background" args={["#bfe3ff"]} />
@@ -435,7 +527,7 @@ function Environment() {
         position={SUN_POSITION}
         intensity={2.6}
         color="#fff6e0"
-        castShadow
+        castShadow={shadowsEnabled}
         shadow-mapSize={[1024, 1024]}
         shadow-camera-left={-22}
         shadow-camera-right={22}
@@ -462,14 +554,39 @@ export default function App() {
   const [score, setScore] = useState(0);
   const [hitmarker, setHitmarker] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [settings, setSettings] = useState<GraphicsSettings>(() => loadGraphicsSettings());
+  const [showSettings, setShowSettings] = useState(false);
+  const compassRef = useRef<CompassHandle>(null);
+
+  const updateSettings = useCallback((next: GraphicsSettings) => {
+    setSettings(next);
+    saveGraphicsSettings(next);
+  }, []);
+
+  // 1v1 duel (online multiplayer) — see network.ts / server/. Declared
+  // early since several handlers below reference these.
+  const [duelStatus, setDuelStatus] = useState<DuelStatus>("idle");
+  const [isPlayerOne, setIsPlayerOne] = useState(true);
+  const [opponentHealth, setOpponentHealth] = useState(100);
+  // What the player TYPES (editable pre-match) vs. the code the server
+  // actually confirmed we're waiting in (shown while queued — lets us
+  // display a code even if the player left it blank and the server
+  // didn't assign one, i.e. anonymous quick-match).
+  const [roomCodeInput, setRoomCodeInput] = useState("");
+  const [waitingRoomCode, setWaitingRoomCode] = useState<string | undefined>(undefined);
+  const duelConnectionRef = useRef<DuelConnection | null>(null);
+  const remotePlayerRef = useRef<RemotePlayerHandle>(null);
 
   const [gameState, setGameState] = useState<GameState>("menu");
   const [mode, setMode] = useState<GameMode>("ffa");
   const [difficulty, setDifficulty] = useState<Difficulty>("medium");
   const [botCount, setBotCount] = useState(3); // FFA enemy count
   const [teamSize, setTeamSize] = useState(2); // TDM: combatants per side, including the player
-  const [scoreLimit, setScoreLimit] = useState<number>(0);
-  const [timeLimit, setTimeLimit] = useState<number>(0);
+  const [scoreLimit, setScoreLimit] = useState<number>(defaultKillLimit("ffa"));
+  const [timeLimit, setTimeLimit] = useState<number>(DEFAULT_TIME_LIMIT);
+  // TDM only: what happens on a tied score at time-out. Off (default) = draw.
+  const [suddenDeath, setSuddenDeath] = useState(false);
+  const [matchEndReason, setMatchEndReason] = useState<MatchEndReason>(null);
 
   const [playerHealth, setPlayerHealth] = useState(100);
   const [botHealths, setBotHealths] = useState<number[]>([]); // enemy team
@@ -495,6 +612,12 @@ export default function App() {
   const scoreLimitRef = useRef(scoreLimit);
   const modeRef = useRef(mode);
   const timeLimitRef = useRef(timeLimit);
+  const suddenDeathRef = useRef(suddenDeath);
+  // True once a tied TDM match has gone to sudden death — the very next
+  // confirmed kill (either side) ends the match immediately, bypassing the
+  // normal kill-limit check. Reset per match in startMatch.
+  const suddenDeathActiveRef = useRef(false);
+  const timeUpProcessedRef = useRef(false);
   const botHealthsRef = useRef<number[]>([]);
   const allyHealthsRef = useRef<number[]>([]);
   const friendlyKillsRef = useRef(0);
@@ -508,6 +631,19 @@ export default function App() {
   useEffect(() => {
     timeLimitRef.current = timeLimit;
   }, [timeLimit]);
+  useEffect(() => {
+    suddenDeathRef.current = suddenDeath;
+  }, [suddenDeath]);
+
+  // Fresh match config screen: default the kill limit to something sane for
+  // whichever mode is selected, rather than carrying over the other mode's
+  // number (or an unlimited 0). Set directly where mode changes (the menu's
+  // mode buttons) rather than in an effect, so switching modes doesn't
+  // trigger an extra cascading render.
+  const selectMode = useCallback((next: GameMode) => {
+    setMode(next);
+    if (next === "ffa" || next === "tdm") setScoreLimit(defaultKillLimit(next));
+  }, []);
 
   const pushKillFeed = useCallback((text: string, tone: "good" | "bad" = "good") => {
     const id = ++killFeedIdRef.current;
@@ -543,6 +679,9 @@ export default function App() {
       setIsReloading(false);
       setScore(0);
       setKillFeed([]);
+      setMatchEndReason(null);
+      suddenDeathActiveRef.current = false;
+      timeUpProcessedRef.current = false;
       setMatchId((id) => id + 1);
       setGameState("playing");
     },
@@ -550,7 +689,12 @@ export default function App() {
   );
 
   const handleRematch = useCallback(() => startMatch(difficulty), [startMatch, difficulty]);
-  const handleBackToMenu = useCallback(() => setGameState("menu"), []);
+  const handleBackToMenu = useCallback(() => {
+    duelConnectionRef.current?.disconnect();
+    duelConnectionRef.current = null;
+    setDuelStatus("idle");
+    setGameState("menu");
+  }, []);
 
   // Free the cursor whenever we leave active play (menu / round end).
   useEffect(() => {
@@ -569,13 +713,30 @@ export default function App() {
       setMatchElapsed((t) => {
         const next = t + 1;
         const limit = timeLimitRef.current;
-        if (limit > 0 && next >= limit) {
+        // Guarded by timeUpProcessedRef so this only fires once — without
+        // it, a sudden-death match (which deliberately stays "playing"
+        // past the limit) would re-run this every second forever.
+        if (limit > 0 && next >= limit && !timeUpProcessedRef.current) {
+          timeUpProcessedRef.current = true;
           if (modeRef.current === "ffa") {
+            // FFA has no second "player" to compare kills against (it's
+            // one human vs. bots) — reaching the clock with the map not
+            // cleared is a completed run, not a loss, so it's scored as a
+            // win with the final kill tally shown on the Match Over screen.
+            setMatchEndReason("timeLimit");
             setGameState((gs) => (gs === "playing" ? "won" : gs));
           } else {
             const f = friendlyKillsRef.current;
             const e = enemyKillsRef.current;
-            setGameState((gs) => (gs === "playing" ? (f === e ? "draw" : f > e ? "won" : "lost") : gs));
+            if (f === e && suddenDeathRef.current) {
+              // Tied at the buzzer with sudden death on: keep playing.
+              // The next confirmed kill (handleHitBot/handleHitAlly)
+              // ends the match immediately regardless of the kill limit.
+              suddenDeathActiveRef.current = true;
+            } else {
+              setMatchEndReason("timeLimit");
+              setGameState((gs) => (gs === "playing" ? (f === e ? "draw" : f > e ? "won" : "lost") : gs));
+            }
           }
         }
         return next;
@@ -587,7 +748,10 @@ export default function App() {
   const handleDamagePlayer = useCallback((dmg: number) => {
     setPlayerHealth((h) => {
       const next = Math.max(0, h - dmg);
-      if (next <= 0) setGameState((gs) => (gs === "playing" ? "lost" : gs));
+      if (next <= 0) {
+        setMatchEndReason("defeated");
+        setGameState((gs) => (gs === "playing" ? "lost" : gs));
+      }
       return next;
     });
     setDamageFlash(true);
@@ -612,12 +776,23 @@ export default function App() {
         pushKillFeed(`You eliminated Enemy ${index + 1}`, "good");
         friendlyKillsRef.current += 1;
         setFriendlyKills(friendlyKillsRef.current);
+
+        // A tied match gone to sudden death ends on the very next kill,
+        // no matter the kill limit — this counts, so it wins outright.
+        if (suddenDeathActiveRef.current) {
+          setMatchEndReason("killLimit");
+          setGameState((gs) => (gs === "playing" ? "won" : gs));
+          return;
+        }
+
         const limit = scoreLimitRef.current;
         if (limit > 0 && friendlyKillsRef.current >= limit) {
+          setMatchEndReason("killLimit");
           setGameState((gs) => (gs === "playing" ? "won" : gs));
           return;
         }
         if (nextArr.every((h) => h <= 0)) {
+          setMatchEndReason("eliminated");
           setGameState((gs) => (gs === "playing" ? "won" : gs));
         }
       }
@@ -641,8 +816,16 @@ export default function App() {
         pushKillFeed(`Ally ${index + 1} was eliminated`, "bad");
         enemyKillsRef.current += 1;
         setEnemyKills(enemyKillsRef.current);
+
+        if (suddenDeathActiveRef.current) {
+          setMatchEndReason("killLimit");
+          setGameState((gs) => (gs === "playing" ? "lost" : gs));
+          return;
+        }
+
         const limit = scoreLimitRef.current;
         if (limit > 0 && enemyKillsRef.current >= limit) {
+          setMatchEndReason("killLimit");
           setGameState((gs) => (gs === "playing" ? "lost" : gs));
         }
       }
@@ -680,10 +863,95 @@ export default function App() {
     }
   }, []);
 
+  // Duel mode only — lets the opponent see this shot's tracer/muzzle flash
+  // too (RaycastShooter still resolves hit detection locally either way).
+  const handleShotFired = useCallback((from: THREE.Vector3, to: THREE.Vector3) => {
+    duelConnectionRef.current?.sendShot([from.x, from.y, from.z], [to.x, to.y, to.z]);
+  }, []);
+
   const handleTargetHit = useCallback(() => {
     setScore((s) => s + 100);
     setHitmarker(true);
     setTimeout(() => setHitmarker(false), 120);
+  }, []);
+
+  const startDuelMatch = useCallback(() => {
+    duelConnectionRef.current?.disconnect();
+
+    setPlayerHealth(100);
+    setOpponentHealth(100);
+    // Defensive: clear any stale FFA/TDM bot state left over from a
+    // previous match played before switching modes.
+    botHealthsRef.current = [];
+    allyHealthsRef.current = [];
+    setBotHealths([]);
+    setAllyHealths([]);
+    setAmmo(30);
+    setIsReloading(false);
+    setScore(0);
+    setKillFeed([]);
+    setDuelStatus("connecting");
+    setWaitingRoomCode(undefined);
+
+    const conn = new DuelConnection({
+      onStatusChange: (status) => setDuelStatus(status),
+      onQueued: (roomCode) => setWaitingRoomCode(roomCode),
+      onMatched: (playerIsOne) => {
+        setIsPlayerOne(playerIsOne);
+        setMatchId((id) => id + 1);
+        setGameState("playing");
+      },
+      onOpponentState: (position, quaternion, moving) => {
+        remotePlayerRef.current?.updateState(position, quaternion, moving);
+      },
+      onOpponentShot: (from, to) => {
+        bulletEffectsRef.current?.addShot(
+          new THREE.Vector3(from[0], from[1], from[2]),
+          new THREE.Vector3(to[0], to[1], to[2])
+        );
+      },
+      onDamage: () => handleDamagePlayer(20),
+      onOpponentHealth: (health) => {
+        setOpponentHealth(health);
+        if (health <= 0) {
+          pushKillFeed("You eliminated the opponent", "good");
+          setGameState((gs) => (gs === "playing" ? "won" : gs));
+        }
+      },
+      onOpponentLeft: () => {
+        pushKillFeed("Opponent disconnected", "good");
+        setGameState((gs) => (gs === "playing" ? "won" : gs));
+      },
+    });
+    duelConnectionRef.current = conn;
+    conn.connect(roomCodeInput.trim() || undefined);
+  }, [handleDamagePlayer, pushKillFeed, roomCodeInput]);
+
+  const handleOpponentHit = useCallback(() => {
+    duelConnectionRef.current?.sendHit();
+  }, []);
+
+  const handleDuelNetworkTick = useCallback(
+    (position: [number, number, number], quaternion: [number, number, number, number], moving: boolean) => {
+      duelConnectionRef.current?.sendState(position, quaternion, moving);
+    },
+    []
+  );
+
+  // Report our own (authoritative) health to the opponent whenever it
+  // changes during an active duel, so their HUD/win-check stays correct.
+  useEffect(() => {
+    if (mode === "duel" && gameState === "playing") {
+      duelConnectionRef.current?.sendHealth(playerHealth);
+    }
+  }, [playerHealth, mode, gameState]);
+
+  // Disconnect on unmount and whenever we leave duel mode.
+  useEffect(() => {
+    return () => {
+      duelConnectionRef.current?.disconnect();
+      duelConnectionRef.current = null;
+    };
   }, []);
 
   return (
@@ -704,19 +972,25 @@ export default function App() {
                 FPS
               </div>
               <p className="text-emerald-400 font-bold text-2xl tracking-wider uppercase mb-1">
-                {mode === "ffa" ? `1 vs ${botCount} Bot${botCount > 1 ? "s" : ""}` : `${teamSize} vs ${teamSize}`}
+                {mode === "ffa"
+                  ? `1 vs ${botCount} Bot${botCount > 1 ? "s" : ""}`
+                  : mode === "tdm"
+                    ? `${teamSize} vs ${teamSize}`
+                    : "1 vs 1 Duel"}
               </p>
               <p className="text-neutral-400 text-xs mb-6">
                 {mode === "ffa"
                   ? "Face off against bots roaming the map. Clear them all to win."
-                  : "Fight alongside allied bots against an enemy team. Wipe them out to win."}
+                  : mode === "tdm"
+                    ? "Fight alongside allied bots against an enemy team. Wipe them out to win."
+                    : "Online 1v1 against a real opponent. First to eliminate the other wins."}
               </p>
 
               <p className="text-neutral-300 text-xs uppercase tracking-widest mb-2">Mode</p>
-              <div className="grid grid-cols-2 gap-2 mb-6">
+              <div className="grid grid-cols-3 gap-2 mb-6">
                 <button
                   type="button"
-                  onClick={() => setMode("ffa")}
+                  onClick={() => selectMode("ffa")}
                   className={`rounded-xl border py-2.5 text-xs font-bold uppercase tracking-wide transition-colors ${
                     mode === "ffa"
                       ? "bg-emerald-500/20 border-emerald-500/70 text-emerald-300"
@@ -727,7 +1001,7 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setMode("tdm")}
+                  onClick={() => selectMode("tdm")}
                   className={`rounded-xl border py-2.5 text-xs font-bold uppercase tracking-wide transition-colors ${
                     mode === "tdm"
                       ? "bg-emerald-500/20 border-emerald-500/70 text-emerald-300"
@@ -736,9 +1010,45 @@ export default function App() {
                 >
                   Team Deathmatch
                 </button>
+                <button
+                  type="button"
+                  onClick={() => selectMode("duel")}
+                  className={`rounded-xl border py-2.5 text-xs font-bold uppercase tracking-wide transition-colors ${
+                    mode === "duel"
+                      ? "bg-emerald-500/20 border-emerald-500/70 text-emerald-300"
+                      : "bg-neutral-800/60 border-neutral-700 text-neutral-400 hover:border-neutral-500"
+                  }`}
+                >
+                  1v1 Online
+                </button>
               </div>
 
-              {mode === "ffa" ? (
+              {mode === "duel" ? (
+                <div className="mb-6">
+                  <p className="text-neutral-300 text-xs uppercase tracking-widest mb-2">Room Code (optional)</p>
+                  <input
+                    type="text"
+                    value={roomCodeInput}
+                    onChange={(e) => setRoomCodeInput(e.target.value.toUpperCase().slice(0, 8))}
+                    disabled={duelStatus === "connecting" || duelStatus === "queued"}
+                    placeholder="Leave blank for quick match"
+                    className="w-full rounded-lg border border-neutral-700 bg-neutral-800/60 px-3 py-2 text-sm text-center tracking-widest font-mono text-emerald-300 placeholder:text-neutral-500 placeholder:tracking-normal placeholder:font-sans disabled:opacity-60 mb-2"
+                  />
+                  <p className="text-neutral-500 text-[10px] mb-3">
+                    Share a code with a friend to play each other directly — both of you enter the same code and hit Find Match. Leave it blank to be paired with anyone.
+                  </p>
+                  <div className="rounded-xl border border-neutral-700 bg-neutral-800/40 py-4 text-xs text-neutral-400">
+                    {duelStatus === "connecting" && "Connecting to server…"}
+                    {duelStatus === "queued" &&
+                      (waitingRoomCode
+                        ? <>Waiting for someone to enter code <span className="text-emerald-300 font-bold tracking-widest">{waitingRoomCode}</span>…</>
+                        : "Waiting for another player to join…")}
+                    {duelStatus === "error" && "Couldn't reach the duel server. Is it running?"}
+                    {(duelStatus === "idle" || duelStatus === "opponent_left") &&
+                      "Click Find Match to get paired with a real opponent."}
+                  </div>
+                </div>
+              ) : mode === "ffa" ? (
                 <>
                   <p className="text-neutral-300 text-xs uppercase tracking-widest mb-2">Number of Bots</p>
                   <div className="grid grid-cols-5 gap-2 mb-6">
@@ -780,6 +1090,8 @@ export default function App() {
                 </>
               )}
 
+              {mode !== "duel" && (
+              <>
               <p className="text-neutral-300 text-xs uppercase tracking-widest mb-2">Select Difficulty</p>
               <div className="grid grid-cols-3 gap-2 mb-6">
                 {(Object.keys(DIFFICULTY_PRESETS) as Difficulty[]).map((key) => (
@@ -842,12 +1154,55 @@ export default function App() {
                 </div>
               </div>
 
+              {mode === "tdm" && (
+                <div className="flex items-center justify-between mb-6 rounded-xl border border-neutral-700 bg-neutral-800/40 px-3.5 py-2.5">
+                  <div className="text-left">
+                    <p className="text-neutral-200 text-xs font-bold">Sudden Death on Tie</p>
+                    <p className="text-neutral-500 text-[10px]">Off: tied at time-out is a draw. On: next kill wins.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setSuddenDeath((v) => !v)}
+                    className={`shrink-0 w-12 h-6 rounded-full border transition-colors relative ${
+                      suddenDeath ? "bg-emerald-500/30 border-emerald-500/70" : "bg-neutral-800 border-neutral-700"
+                    }`}
+                  >
+                    <span
+                      className={`absolute top-0.5 w-4 h-4 rounded-full transition-all ${
+                        suddenDeath ? "left-6 bg-emerald-400" : "left-0.5 bg-neutral-500"
+                      }`}
+                    />
+                  </button>
+                </div>
+              )}
+              </>
+              )}
+
+              {mode === "duel" ? (
+                <button
+                  type="button"
+                  disabled={duelStatus === "connecting" || duelStatus === "queued"}
+                  onClick={startDuelMatch}
+                  className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:bg-neutral-700 disabled:text-neutral-400 text-neutral-950 font-bold uppercase tracking-wider text-sm py-3 rounded-xl shadow-lg transition-colors"
+                >
+                  {duelStatus === "connecting" || duelStatus === "queued" ? "Searching…" : "Find Match"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => startMatch(difficulty)}
+                  className="w-full bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-bold uppercase tracking-wider text-sm py-3 rounded-xl shadow-lg transition-colors"
+                >
+                  Start Match
+                </button>
+              )}
+
               <button
                 type="button"
-                onClick={() => startMatch(difficulty)}
-                className="w-full bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-bold uppercase tracking-wider text-sm py-3 rounded-xl shadow-lg transition-colors"
+                onClick={() => setShowSettings(true)}
+                className="w-full mt-2.5 bg-neutral-800/60 hover:bg-neutral-800 border border-neutral-700 text-neutral-300 hover:text-emerald-300 font-bold uppercase tracking-wider text-xs py-2 rounded-xl transition-colors"
               >
-                Start Match
+                ⚙ Graphics
               </button>
             </div>
           </div>
@@ -868,26 +1223,57 @@ export default function App() {
                     : "border-red-500/50"
               }`}
             >
+              <p className="text-neutral-500 text-[10px] uppercase tracking-[0.2em] mb-1">Match Over</p>
               <p
-                className={`font-black text-4xl tracking-wider uppercase mb-2 ${
+                className={`font-black text-4xl tracking-wider uppercase mb-1 ${
                   gameState === "won" ? "text-emerald-400" : gameState === "draw" ? "text-amber-400" : "text-red-500"
                 }`}
               >
                 {gameState === "won" ? "You Win" : gameState === "draw" ? "Draw" : "You Lose"}
               </p>
-              <p className="text-neutral-400 text-xs mb-6">
-                {mode === "tdm"
-                  ? `${friendlyKills} - ${enemyKills} · ${DIFFICULTY_PRESETS[difficulty].label}`
-                  : `${botHealths.length} ${DIFFICULTY_PRESETS[difficulty].label} bot${botHealths.length > 1 ? "s" : ""}`}
-                &nbsp;·&nbsp; Score {score}
-              </p>
+              {mode !== "duel" && matchEndReason && (
+                <p className="text-neutral-400 text-xs mb-4">{formatMatchEndReason(matchEndReason)}</p>
+              )}
+
+              {/* Final scoreboard */}
+              {mode === "tdm" ? (
+                <div className="bg-neutral-800/50 border border-neutral-700 rounded-xl px-4 py-3 mb-6 text-left">
+                  <div className="flex items-center justify-center gap-3 text-lg font-bold mb-2">
+                    <span className="text-sky-400">{friendlyKills}</span>
+                    <span className="text-neutral-600 text-sm">—</span>
+                    <span className="text-red-400">{enemyKills}</span>
+                    {scoreLimit > 0 && <span className="text-neutral-500 text-xs font-normal">/ {scoreLimit}</span>}
+                  </div>
+                  <div className="flex justify-between text-[11px] text-neutral-400">
+                    <span>Allies alive: {allyHealths.filter((h) => h > 0).length}/{allyHealths.length}</span>
+                    <span>Enemies alive: {botHealths.filter((h) => h > 0).length}/{botHealths.length}</span>
+                  </div>
+                  <div className="text-[11px] text-neutral-500 mt-1">{DIFFICULTY_PRESETS[difficulty].label} · Score {score}</div>
+                </div>
+              ) : mode === "ffa" ? (
+                <div className="bg-neutral-800/50 border border-neutral-700 rounded-xl px-4 py-3 mb-6 text-left">
+                  <div className="flex items-center justify-center gap-1.5 text-lg font-bold mb-2">
+                    <span className="text-emerald-400">{friendlyKills}</span>
+                    <span className="text-neutral-500 text-sm font-normal">
+                      {scoreLimit > 0 ? `/ ${scoreLimit} kills` : "kills"}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-neutral-400 text-center">
+                    Enemies eliminated: {botHealths.filter((h) => h <= 0).length}/{botHealths.length}
+                  </div>
+                  <div className="text-[11px] text-neutral-500 mt-1 text-center">{DIFFICULTY_PRESETS[difficulty].label} · Score {score}</div>
+                </div>
+              ) : (
+                <p className="text-neutral-400 text-xs mb-6">1v1 Online Duel</p>
+              )}
+
               <div className="flex gap-3">
                 <button
                   type="button"
-                  onClick={handleRematch}
+                  onClick={mode === "duel" ? startDuelMatch : handleRematch}
                   className="flex-1 bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-bold uppercase tracking-wider text-sm py-3 rounded-xl shadow-lg transition-colors"
                 >
-                  Rematch
+                  {mode === "duel" ? "Find New Match" : "Rematch"}
                 </button>
                 <button
                   type="button"
@@ -947,26 +1333,40 @@ export default function App() {
 
         {/* Team / Enemy Status + Scoreboard + Timer (top-center) */}
         {gameState !== "menu" && botHealths.length > 0 && (
-          <div className="pointer-events-none absolute top-4 left-1/2 -translate-x-1/2 z-20 font-mono w-72 space-y-1.5">
-            {(timeLimit > 0 || (mode === "tdm" && scoreLimit > 0)) && (
+          <div className="pointer-events-none absolute top-9 left-1/2 -translate-x-1/2 z-20 font-mono w-72 space-y-1.5">
+            {(timeLimit > 0 || scoreLimit > 0) && (
               <div className="flex justify-center gap-2 text-[11px]">
-                {mode === "tdm" && (
+                {mode === "tdm" && scoreLimit > 0 && (
                   <div className="bg-neutral-900/85 backdrop-blur-md border border-neutral-700/60 px-3 py-1 rounded-lg shadow-lg">
                     <span className="text-sky-400 font-bold">{friendlyKills}</span>
                     <span className="text-neutral-500"> - </span>
                     <span className="text-red-400 font-bold">{enemyKills}</span>
-                    {scoreLimit > 0 && <span className="text-neutral-500"> / {scoreLimit}</span>}
+                    <span className="text-neutral-500"> / {scoreLimit}</span>
                   </div>
                 )}
-                {timeLimit > 0 && (
-                  <div className="bg-neutral-900/85 backdrop-blur-md border border-neutral-700/60 px-3 py-1 rounded-lg shadow-lg text-neutral-300">
-                    {Math.floor(Math.max(0, timeLimit - matchElapsed) / 60)
-                      .toString()
-                      .padStart(2, "0")}
-                    :
-                    {(Math.max(0, timeLimit - matchElapsed) % 60).toString().padStart(2, "0")}
+                {mode === "ffa" && scoreLimit > 0 && (
+                  <div className="bg-neutral-900/85 backdrop-blur-md border border-neutral-700/60 px-3 py-1 rounded-lg shadow-lg">
+                    <span className="text-neutral-400">Kills </span>
+                    <span className="text-emerald-400 font-bold">{friendlyKills}</span>
+                    <span className="text-neutral-500"> / {scoreLimit}</span>
                   </div>
                 )}
+                {timeLimit > 0 && (() => {
+                  const remaining = Math.max(0, timeLimit - matchElapsed);
+                  const urgent = remaining <= 30;
+                  return (
+                    <div
+                      className={`backdrop-blur-md border px-3 py-1 rounded-lg shadow-lg ${
+                        urgent
+                          ? "bg-red-950/80 border-red-500/70 text-red-300 animate-pulse"
+                          : "bg-neutral-900/85 border-neutral-700/60 text-neutral-300"
+                      }`}
+                    >
+                      {Math.floor(remaining / 60).toString().padStart(2, "0")}:
+                      {(remaining % 60).toString().padStart(2, "0")}
+                    </div>
+                  );
+                })()}
               </div>
             )}
 
@@ -1007,6 +1407,24 @@ export default function App() {
                     />
                   </div>
                 ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Opponent Status (1v1 duel only) */}
+        {mode === "duel" && gameState !== "menu" && (
+          <div className="pointer-events-none absolute top-9 left-1/2 -translate-x-1/2 z-20 font-mono w-72">
+            <div className="bg-neutral-900/85 backdrop-blur-md border border-red-900/60 px-3 py-2 rounded-xl shadow-lg">
+              <div className="flex items-center justify-between text-[10px] text-neutral-400 uppercase tracking-widest mb-1.5">
+                <span>Opponent</span>
+                <span className="text-red-400 font-bold">{Math.ceil(opponentHealth)}</span>
+              </div>
+              <div className="w-full h-1.5 bg-neutral-800 rounded-full overflow-hidden">
+                <div
+                  className={`h-full transition-all duration-150 ${opponentHealth > 0 ? "bg-red-500" : "bg-neutral-700"}`}
+                  style={{ width: `${Math.max(0, opponentHealth)}%` }}
+                />
               </div>
             </div>
           </div>
@@ -1062,19 +1480,44 @@ export default function App() {
             </div>
           )}
 
-          {/* Fullscreen Toggle */}
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              toggleFullscreen();
-            }}
-            className="pointer-events-auto bg-neutral-900/80 backdrop-blur-md border border-neutral-700/60 px-3 py-2 rounded-xl text-neutral-300 hover:text-emerald-400 hover:border-emerald-500/50 shadow-lg transition-colors"
-            title={isFullscreen ? "Exit Fullscreen" : "Enter Fullscreen"}
-          >
-            {isFullscreen ? "⤡" : "⤢"}
-          </button>
+          {/* Fullscreen + Graphics Settings */}
+          <div className="flex items-start gap-2">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleFullscreen();
+              }}
+              className="pointer-events-auto bg-neutral-900/80 backdrop-blur-md border border-neutral-700/60 px-3 py-2 rounded-xl text-neutral-300 hover:text-emerald-400 hover:border-emerald-500/50 shadow-lg transition-colors"
+              title={isFullscreen ? "Exit Fullscreen" : "Enter Fullscreen"}
+            >
+              {isFullscreen ? "⤡" : "⤢"}
+            </button>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowSettings(true);
+              }}
+              className="pointer-events-auto bg-neutral-900/80 backdrop-blur-md border border-neutral-700/60 px-3 py-2 rounded-xl text-neutral-300 hover:text-emerald-400 hover:border-emerald-500/50 shadow-lg transition-colors"
+              title="Graphics Settings"
+            >
+              ⚙
+            </button>
+          </div>
         </div>
+
+        {/* Compass */}
+        {gameState !== "menu" && <Compass ref={compassRef} />}
+
+        {showSettings && (
+          <GraphicsSettingsPanel
+            settings={settings}
+            onChange={updateSettings}
+            onClose={() => setShowSettings(false)}
+          />
+        )}
 
         {/* HUD Bottom Bar: Ammo & Weapon Specs */}
         {gameState !== "menu" && (
@@ -1110,8 +1553,8 @@ export default function App() {
 
         {/* 3D Scene Viewport */}
         <Canvas
-          shadows="percentage"
-          dpr={[1, 1.5]}
+          shadows={settings.shadows ? "percentage" : false}
+          dpr={[Math.min(1, settings.resolutionScale), 1.5 * settings.resolutionScale]}
           gl={{ antialias: true, powerPreference: "high-performance" }}
           camera={{ fov: 75, near: 0.01, far: 1000, position: [0, 2, 0], rotation: [0, 0, 0] }}
           className="w-full h-full cursor-crosshair"
@@ -1127,7 +1570,9 @@ export default function App() {
             />
           )}
 
-          <Environment />
+          {gameState !== "menu" && <CompassDriver compassRef={compassRef} />}
+
+          <Environment shadowsEnabled={settings.shadows} />
 
           {gameState !== "menu" && (
             <>
@@ -1150,6 +1595,7 @@ export default function App() {
                 onRegisterShot={handleRegisterShot}
                 bulletEffectsRef={bulletEffectsRef}
                 onTargetHit={handleTargetHit}
+                onShotFired={mode === "duel" ? handleShotFired : undefined}
               />
             </>
           )}
@@ -1162,10 +1608,23 @@ export default function App() {
                   onMoveStateChange={setIsMoving}
                   registry={registry}
                   onDamageTaken={handleDamagePlayer}
+                  spawnPosition={mode === "duel" ? DUEL_SPAWN_POINTS[isPlayerOne ? 0 : 1] : undefined}
+                  spawnYaw={mode === "duel" ? (isPlayerOne ? 0 : Math.PI) : undefined}
+                  onNetworkTick={mode === "duel" ? handleDuelNetworkTick : undefined}
                 />
               )}
 
-              {gameState !== "menu" &&
+              {mode === "duel" && gameState === "playing" && (
+                <RemotePlayer
+                  key={`opponent-${matchId}`}
+                  ref={remotePlayerRef}
+                  health={opponentHealth}
+                  onHit={handleOpponentHit}
+                />
+              )}
+
+              {mode !== "duel" &&
+                gameState !== "menu" &&
                 botHealths.map((h, i) => (
                   <Bot
                     key={`enemy-${matchId}-${i}`}
@@ -1182,7 +1641,8 @@ export default function App() {
                   />
                 ))}
 
-              {gameState !== "menu" &&
+              {mode !== "duel" &&
+                gameState !== "menu" &&
                 allyHealths.map((h, i) => (
                   <Bot
                     key={`ally-${matchId}-${i}`}
@@ -1201,32 +1661,41 @@ export default function App() {
 
               {/* 3D Map */}
               <GameMap scale={0.16} />
-              <HumanTarget position={[0, -0.16, -5]} />
 
-              {/* Shootable Reactive Practice Targets */}
-              <ShootableTarget position={[1.5, 0.4, -4]} color="#0ea5e9" />
-              <ShootableTarget position={[-1.8, 0.4, -5]} color="#a855f7" />
-              <ShootableTarget position={[0, 0.8, -7]} color="#eab308" />
-              <ShootableTarget position={[3.2, 0.4, -3]} color="#ec4899" />
+              {/* Practice dummies — not part of a real 1v1 duel arena */}
+              {mode !== "duel" && (
+                <>
+                  <HumanTarget position={[0, -0.16, -5]} />
+                  <ShootableTarget position={[1.5, 0.4, -4]} color="#0ea5e9" />
+                  <ShootableTarget position={[-1.8, 0.4, -5]} color="#a855f7" />
+                  <ShootableTarget position={[0, 0.8, -7]} color="#eab308" />
+                  <ShootableTarget position={[3.2, 0.4, -3]} color="#ec4899" />
+                </>
+              )}
             </Physics>
           </Suspense>
 
           {/* Post-processing: bloom for muzzle flash/impacts/emissives, subtle
-              vignette + chromatic aberration for a cinematic FPS look. */}
-          <EffectComposer multisampling={2}>
-            <Bloom
-              luminanceThreshold={0.35}
-              luminanceSmoothing={0.2}
-              mipmapBlur
-              intensity={0.8}
-              radius={0.6}
-            />
-            <ChromaticAberration
-              blendFunction={BlendFunction.NORMAL}
-              offset={[0.0006, 0.0006]}
-            />
-            <Vignette eskil={false} offset={0.25} darkness={0.9} />
-          </EffectComposer>
+              vignette + chromatic aberration for a cinematic FPS look.
+              Skippable via Graphics settings — it's a real per-frame GPU
+              cost (an extra full-screen render pass) for a purely
+              cosmetic effect. */}
+          {settings.postProcessing && (
+            <EffectComposer multisampling={2}>
+              <Bloom
+                luminanceThreshold={0.35}
+                luminanceSmoothing={0.2}
+                mipmapBlur
+                intensity={0.8}
+                radius={0.6}
+              />
+              <ChromaticAberration
+                blendFunction={BlendFunction.NORMAL}
+                offset={[0.0006, 0.0006]}
+              />
+              <Vignette eskil={false} offset={0.25} darkness={0.9} />
+            </EffectComposer>
+          )}
         </Canvas>
     </div>
   );
