@@ -13,6 +13,40 @@ function getAudioContext(): AudioContext {
   return audioCtx;
 }
 
+// Small pool of pre-generated noise buffers, reused across every play*Sound
+// call instead of re-synthesizing (a fresh AudioBuffer allocation plus
+// thousands of Math.random() calls) on every single play. A shot or
+// footstep replayed from a static noise buffer is indistinguishable by
+// ear, and caching removes real per-call CPU work from the game's hottest
+// audio paths — rapid fire and running both trigger these several times a
+// second.
+const whiteNoiseCache = new Map<number, AudioBuffer>();
+function getWhiteNoiseBuffer(ctx: AudioContext, seconds: number): AudioBuffer {
+  let buf = whiteNoiseCache.get(seconds);
+  if (buf) return buf;
+  const size = Math.floor(ctx.sampleRate * seconds);
+  buf = ctx.createBuffer(1, size, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < size; i++) data[i] = Math.random() * 2 - 1;
+  whiteNoiseCache.set(seconds, buf);
+  return buf;
+}
+
+// Same idea, but for noise that linearly decays to silence within the
+// buffer itself (rather than via a GainNode envelope) — used for the
+// gunshot's short slap-back tail.
+const taperedNoiseCache = new Map<number, AudioBuffer>();
+function getTaperedNoiseBuffer(ctx: AudioContext, seconds: number): AudioBuffer {
+  let buf = taperedNoiseCache.get(seconds);
+  if (buf) return buf;
+  const size = Math.floor(ctx.sampleRate * seconds);
+  buf = ctx.createBuffer(1, size, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < size; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / size);
+  taperedNoiseCache.set(seconds, buf);
+  return buf;
+}
+
 // Crisp, punchy assault rifle gunshot sound
 export function playGunshotSound() {
   try {
@@ -20,15 +54,8 @@ export function playGunshotSound() {
     const now = ctx.currentTime;
 
     // 1. Noise Burst (Gunshot Crack / High Frequency Blast)
-    const bufferSize = ctx.sampleRate * 0.15;
-    const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-    const output = noiseBuffer.getChannelData(0);
-    for (let i = 0; i < bufferSize; i++) {
-      output[i] = Math.random() * 2 - 1;
-    }
-
     const whiteNoise = ctx.createBufferSource();
-    whiteNoise.buffer = noiseBuffer;
+    whiteNoise.buffer = getWhiteNoiseBuffer(ctx, 0.15);
 
     const noiseFilter = ctx.createBiquadFilter();
     noiseFilter.type = "bandpass";
@@ -77,14 +104,8 @@ export function playGunshotSound() {
     crackOsc.stop(now + 0.025);
 
     // 4. Short slap-back tail (fake early reflection, adds body/space to the shot)
-    const tailSize = Math.floor(ctx.sampleRate * 0.1);
-    const tailBuffer = ctx.createBuffer(1, tailSize, ctx.sampleRate);
-    const tailData = tailBuffer.getChannelData(0);
-    for (let i = 0; i < tailSize; i++) {
-      tailData[i] = (Math.random() * 2 - 1) * (1 - i / tailSize);
-    }
     const tailNoise = ctx.createBufferSource();
-    tailNoise.buffer = tailBuffer;
+    tailNoise.buffer = getTaperedNoiseBuffer(ctx, 0.1);
     const tailFilter = ctx.createBiquadFilter();
     tailFilter.type = "bandpass";
     tailFilter.frequency.value = 900;
@@ -208,13 +229,8 @@ export function playFootstepSound() {
     const ctx = getAudioContext();
     const now = ctx.currentTime;
 
-    const bufferSize = Math.floor(ctx.sampleRate * 0.06);
-    const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-    const output = noiseBuffer.getChannelData(0);
-    for (let i = 0; i < bufferSize; i++) output[i] = Math.random() * 2 - 1;
-
     const noise = ctx.createBufferSource();
-    noise.buffer = noiseBuffer;
+    noise.buffer = getWhiteNoiseBuffer(ctx, 0.06);
 
     const filter = ctx.createBiquadFilter();
     filter.type = "lowpass";
@@ -263,13 +279,8 @@ export function playLandSound() {
     const ctx = getAudioContext();
     const now = ctx.currentTime;
 
-    const bufferSize = Math.floor(ctx.sampleRate * 0.09);
-    const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-    const output = noiseBuffer.getChannelData(0);
-    for (let i = 0; i < bufferSize; i++) output[i] = Math.random() * 2 - 1;
-
     const noise = ctx.createBufferSource();
-    noise.buffer = noiseBuffer;
+    noise.buffer = getWhiteNoiseBuffer(ctx, 0.09);
     const filter = ctx.createBiquadFilter();
     filter.type = "lowpass";
     filter.frequency.setValueAtTime(260, now);
@@ -361,13 +372,8 @@ export function playEnemyGunshotSound() {
     const ctx = getAudioContext();
     const now = ctx.currentTime;
 
-    const bufferSize = ctx.sampleRate * 0.15;
-    const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-    const output = noiseBuffer.getChannelData(0);
-    for (let i = 0; i < bufferSize; i++) output[i] = Math.random() * 2 - 1;
-
     const whiteNoise = ctx.createBufferSource();
-    whiteNoise.buffer = noiseBuffer;
+    whiteNoise.buffer = getWhiteNoiseBuffer(ctx, 0.15);
 
     const noiseFilter = ctx.createBiquadFilter();
     noiseFilter.type = "bandpass";
@@ -406,13 +412,8 @@ export function playPlayerHurtSound() {
     const ctx = getAudioContext();
     const now = ctx.currentTime;
 
-    const bufferSize = Math.floor(ctx.sampleRate * 0.12);
-    const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-    const output = noiseBuffer.getChannelData(0);
-    for (let i = 0; i < bufferSize; i++) output[i] = Math.random() * 2 - 1;
-
     const noise = ctx.createBufferSource();
-    noise.buffer = noiseBuffer;
+    noise.buffer = getWhiteNoiseBuffer(ctx, 0.12);
     const filter = ctx.createBiquadFilter();
     filter.type = "lowpass";
     filter.frequency.setValueAtTime(500, now);

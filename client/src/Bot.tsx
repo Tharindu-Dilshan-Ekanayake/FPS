@@ -44,6 +44,10 @@ function shortestAngleDiff(a: number, b: number) {
   return Math.atan2(Math.sin(a - b), Math.cos(a - b));
 }
 
+// Shared, reused-in-place by rotateAround below (never mutated) — avoids a
+// fresh Vector2 allocation every frame just to express "rotate about origin".
+const ORIGIN_2D = /* @__PURE__ */ new THREE.Vector2(0, 0);
+
 function randomInBounds(min: THREE.Vector2, max: THREE.Vector2, out: THREE.Vector2) {
   out.set(
     THREE.MathUtils.lerp(min.x, max.x, Math.random()),
@@ -158,6 +162,29 @@ export function Bot({
   const avoidTurn = useRef(0);
   const lastPos = useRef(new THREE.Vector2(spawnPosition[0], spawnPosition[2]));
 
+  // The enemy model has no death/ragdoll animation clip at all, so without
+  // this a killed bot just keeps looping whatever it was last playing
+  // (walk/run/idle) forever, standing there like it's still alive. Fake a
+  // death instead: freeze the animation and tip the model over.
+  const deathTriggered = useRef(false);
+  const deathProgress = useRef(0);
+  const DEATH_FALL_SECONDS = 0.5;
+
+  // Scratch vectors reused every frame instead of `new THREE.Vector2/3(...)`
+  // — with several bots active at once, allocating half a dozen temp vectors
+  // per bot per frame adds up to real garbage-collector pressure, which
+  // shows up as intermittent stutter rather than a steady frame cost.
+  const myPosVec = useRef(new THREE.Vector3());
+  const toTargetVec = useRef(new THREE.Vector2());
+  const dirToTargetVec = useRef(new THREE.Vector2());
+  const moveDirVec = useRef(new THREE.Vector2());
+  const toWpVec = useRef(new THREE.Vector2());
+  const probeDirVec = useRef(new THREE.Vector2());
+  const muzzleVec = useRef(new THREE.Vector3());
+  const muzzleOffsetVec = useRef(new THREE.Vector3());
+  const targetVec = useRef(new THREE.Vector3());
+  const spreadVec = useRef(new THREE.Vector3());
+
   // Register this bot as a combatant so other bots (and the player's own
   // registry entry) can find and attack it. onDamageTaken is expected to be
   // a stable (useCallback'd) reference from the parent.
@@ -202,6 +229,24 @@ export function Bot({
       myEntry.alive = active && health > 0;
     }
 
+    if (health <= 0) {
+      if (!deathTriggered.current) {
+        deathTriggered.current = true;
+        // Stop whatever loop (walk/run/idle) was playing instead of
+        // leaving it running underneath the fall.
+        if (actions && currentAnimRef.current) actions[currentAnimRef.current]?.fadeOut(0.2);
+      }
+      deathProgress.current = Math.min(deathProgress.current + delta / DEATH_FALL_SECONDS, 1);
+      const eased = 1 - Math.pow(1 - deathProgress.current, 3); // ease-out
+      if (visualRef.current) {
+        visualRef.current.rotation.x = -(Math.PI / 2) * eased;
+        visualRef.current.position.y = modelOffsetY - capsuleHalfHeight * 0.6 * eased;
+      }
+      return;
+    }
+    deathTriggered.current = false;
+    deathProgress.current = 0;
+
     if (!active) return;
     elapsed.current += delta;
     if (flashTimer.current > 0) {
@@ -209,12 +254,14 @@ export function Bot({
       if (flashLightRef.current) flashLightRef.current.visible = flashTimer.current > 0;
     }
 
-    const target = findNearestOpponent(registry, team, new THREE.Vector3(myPos.x, myPos.y, myPos.z));
-    const toTarget = target
-      ? new THREE.Vector2(target.position.x - myPos.x, target.position.z - myPos.z)
-      : new THREE.Vector2(0, 0);
+    const target = findNearestOpponent(registry, team, myPosVec.current.set(myPos.x, myPos.y, myPos.z));
+    const toTarget = toTargetVec.current;
+    if (target) toTarget.set(target.position.x - myPos.x, target.position.z - myPos.z);
+    else toTarget.set(0, 0);
     const distToTarget = toTarget.length();
-    const dirToTarget = distToTarget > 0 ? toTarget.clone().divideScalar(distToTarget) : new THREE.Vector2(0, 1);
+    const dirToTarget = dirToTargetVec.current;
+    if (distToTarget > 0) dirToTarget.copy(toTarget).divideScalar(distToTarget);
+    else dirToTarget.set(0, 1);
 
     // Line-of-sight is checked a few times a second (not every frame) via a
     // fast Rapier physics raycast — much cheaper than scanning the three.js
@@ -240,7 +287,7 @@ export function Bot({
     const lowHealth = health / maxHealth <= LOW_HEALTH_FRACTION;
     const engaging = !!target && losClear.current && distToTarget <= SIGHT_RANGE;
 
-    const moveDir = new THREE.Vector2(0, 0);
+    const moveDir = moveDirVec.current.set(0, 0);
     let desiredYaw = facing.current;
     let crouching = false;
 
@@ -274,25 +321,26 @@ export function Bot({
         flashTimer.current = 0.06;
         if (flashLightRef.current) flashLightRef.current.visible = true;
 
-        const muzzle = new THREE.Vector3(myPos.x, myPos.y + TARGET_HEIGHT * 0.75, myPos.z).add(
-          new THREE.Vector3(dirToTarget.x, 0, dirToTarget.y).multiplyScalar(TARGET_HEIGHT * 0.35)
+        const muzzle = muzzleVec.current.set(myPos.x, myPos.y + TARGET_HEIGHT * 0.75, myPos.z);
+        muzzle.add(
+          muzzleOffsetVec.current.set(dirToTarget.x, 0, dirToTarget.y).multiplyScalar(TARGET_HEIGHT * 0.35)
         );
-        const targetVec = target.position.clone();
+        const tVec = targetVec.current.copy(target.position);
         if (Math.random() < preset.accuracy) {
           target.damage(preset.damage);
-          bulletEffectsRef.current?.addShot(muzzle, targetVec);
+          bulletEffectsRef.current?.addShot(muzzle, tVec);
         } else {
-          const spread = new THREE.Vector3(
+          const spread = spreadVec.current.set(
             (Math.random() - 0.5) * 1.2,
             (Math.random() - 0.5) * 0.7,
             (Math.random() - 0.5) * 1.2
           );
-          bulletEffectsRef.current?.addShot(muzzle, targetVec.add(spread));
+          bulletEffectsRef.current?.addShot(muzzle, tVec.add(spread));
         }
       }
     } else {
       // Wander toward a roaming waypoint spread across the whole map.
-      const toWp = new THREE.Vector2(waypoint.current.x - myPos.x, waypoint.current.y - myPos.z);
+      const toWp = toWpVec.current.set(waypoint.current.x - myPos.x, waypoint.current.y - myPos.z);
       if (toWp.length() < WAYPOINT_RADIUS) {
         randomInBounds(WANDER_MIN, WANDER_MAX, waypoint.current);
       } else {
@@ -310,7 +358,7 @@ export function Bot({
     nextAvoidCheck.current -= delta;
     if (moveDir.lengthSq() > 0 && nextAvoidCheck.current <= 0) {
       nextAvoidCheck.current = 0.12;
-      const probeDir = moveDir.clone().normalize();
+      const probeDir = probeDirVec.current.copy(moveDir).normalize();
       const ray = new rapier.Ray(
         { x: myPos.x, y: myPos.y + capsuleHalfHeight, z: myPos.z },
         { x: probeDir.x, y: 0, z: probeDir.y }
@@ -319,7 +367,7 @@ export function Bot({
       avoidTurn.current = hit && hit.timeOfImpact < 0.45 ? Math.PI / 2 * (Math.random() < 0.5 ? 1 : -1) : 0;
     }
     if (avoidTurn.current !== 0) {
-      moveDir.rotateAround(new THREE.Vector2(0, 0), avoidTurn.current);
+      moveDir.rotateAround(ORIGIN_2D, avoidTurn.current);
     }
 
     // If genuinely stuck (not making progress while trying to move), force
