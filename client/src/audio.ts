@@ -223,6 +223,43 @@ export function playHitSound() {
   }
 }
 
+// Headshot Confirmation — a sharper, higher "ping" than the regular hit
+// sound: a short bright sine ring plus a quiet upper-octave overtone, so a
+// headshot is unmistakably distinct from a body shot by ear alone.
+export function playHeadshotSound() {
+  try {
+    const ctx = getAudioContext();
+    const now = ctx.currentTime;
+
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(2000, now);
+    osc.frequency.exponentialRampToValueAtTime(2600, now + 0.05);
+    gain.gain.setValueAtTime(0.32, now);
+    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.14);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(now);
+    osc.stop(now + 0.14);
+
+    // Quiet overtone an octave up gives it a metallic "ping" quality
+    // rather than a plain tone.
+    const overtone = ctx.createOscillator();
+    const overtoneGain = ctx.createGain();
+    overtone.type = "sine";
+    overtone.frequency.setValueAtTime(4000, now);
+    overtoneGain.gain.setValueAtTime(0.12, now);
+    overtoneGain.gain.exponentialRampToValueAtTime(0.01, now + 0.09);
+    overtone.connect(overtoneGain);
+    overtoneGain.connect(ctx.destination);
+    overtone.start(now);
+    overtone.stop(now + 0.09);
+  } catch {
+    // Web Audio unavailable or blocked by browser policy
+  }
+}
+
 // Footstep — soft filtered thud, pitch-varied so a run doesn't sound robotic
 export function playFootstepSound() {
   try {
