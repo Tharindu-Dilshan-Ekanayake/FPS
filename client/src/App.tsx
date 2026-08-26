@@ -705,6 +705,12 @@ export default function App() {
   // didn't assign one, i.e. anonymous quick-match).
   const [roomCodeInput, setRoomCodeInput] = useState("");
   const [waitingRoomCode, setWaitingRoomCode] = useState<string | undefined>(undefined);
+  // True only right after clicking "Generate" — typing/editing the code by
+  // hand (pasting a friend's code to join their room) clears it. Gates the
+  // match-settings picker below: only the person creating the room (the one
+  // who generated its code) should be choosing kill/time limits, not
+  // whoever is about to join with a code someone shared with them.
+  const [roomCodeIsGenerated, setRoomCodeIsGenerated] = useState(false);
   // Pre-match picks for a room the player is about to CREATE. Only take
   // effect when they're the first one waiting under a room code — an
   // anonymous quick-match or joining someone else's code ignores these
@@ -1360,14 +1366,20 @@ export default function App() {
                     <input
                       type="text"
                       value={roomCodeInput}
-                      onChange={(e) => setRoomCodeInput(e.target.value.toUpperCase().slice(0, 8))}
+                      onChange={(e) => {
+                        setRoomCodeInput(e.target.value.toUpperCase().slice(0, 8));
+                        setRoomCodeIsGenerated(false);
+                      }}
                       disabled={duelStatus === "connecting" || duelStatus === "queued"}
                       placeholder="Leave blank for quick match"
                       className="flex-1 min-w-0 rounded-lg border border-neutral-700 bg-neutral-800/60 px-3 py-2 text-sm text-center tracking-widest font-mono text-emerald-300 placeholder:text-neutral-500 placeholder:tracking-normal placeholder:font-sans disabled:opacity-60"
                     />
                     <button
                       type="button"
-                      onClick={() => setRoomCodeInput(generateRoomCode())}
+                      onClick={() => {
+                        setRoomCodeInput(generateRoomCode());
+                        setRoomCodeIsGenerated(true);
+                      }}
                       disabled={duelStatus === "connecting" || duelStatus === "queued"}
                       className="shrink-0 rounded-lg border border-emerald-500/50 bg-emerald-500/10 px-3 py-2 text-xs font-bold uppercase tracking-wide text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-60 transition-colors"
                     >
@@ -1375,14 +1387,14 @@ export default function App() {
                     </button>
                   </div>
                   <p className="text-neutral-500 text-[10px] mb-3">
-                    Share a code with a friend to play each other directly — both of you enter the same code and hit Find Match. Leave it blank to be paired with anyone.
+                    To play a friend directly: click Generate, share the code with them, and pick your match settings below. They just type that same code in and hit Find Match — no settings to choose on their end. Leave it blank to be paired with anyone.
                   </p>
 
-                  {roomCodeInput.trim().length > 0 && (
+                  {roomCodeIsGenerated && (
                     <div className="mb-3 text-left">
                       <p className="text-neutral-300 text-xs uppercase tracking-widest mb-2">Match Settings</p>
                       <p className="text-neutral-500 text-[10px] mb-2">
-                        Only applies if you're the first one to open this room code — a friend joining after you plays by these settings.
+                        You're creating this room, so you choose the rules — your friend just enters the code above to join and play by them.
                       </p>
                       <p className="text-neutral-400 text-[10px] uppercase tracking-wide mb-1">Kill Limit</p>
                       <div className="grid grid-cols-4 gap-1.5 mb-2">
