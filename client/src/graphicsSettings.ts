@@ -7,8 +7,14 @@ export interface GraphicsSettings {
   resolutionScale: number; // 0.6–1, multiplies the render's device pixel ratio
 }
 
+// Shadow mapping is the single most expensive toggle on integrated/low-end
+// GPUs (real-time shadow map rendering for every shadow-casting object, every
+// frame), so it defaults off — a low-end PC's first match should run smoothly
+// without the player needing to find the settings panel first. Still fully
+// adjustable in-game; a capable machine can turn it back on in a couple of
+// clicks.
 export const DEFAULT_GRAPHICS_SETTINGS: GraphicsSettings = {
-  shadows: true,
+  shadows: false,
   postProcessing: true,
   resolutionScale: 1,
 };
