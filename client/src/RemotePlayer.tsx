@@ -1,6 +1,6 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from "react";
 import { useFrame } from "@react-three/fiber";
-import { useGLTF, useAnimations } from "@react-three/drei";
+import { useGLTF, useAnimations, Billboard, Text } from "@react-three/drei";
 import { RigidBody, RapierRigidBody, CapsuleCollider } from "@react-three/rapier";
 import * as THREE from "three";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
@@ -14,15 +14,22 @@ const ENEMY_URL = "/enime.glb"; // already preloaded by Bot.tsx
 // with how Player (App.tsx) reports its own camera position.
 const TARGET_HEIGHT = 0.5;
 
-// A hit above this fraction of the character's height (measured from the
-// feet) counts as a headshot. There's no separate head hitbox/bone lookup
-// here — this rig only has one capsule collider, and the raycast already
-// hits the visible mesh directly, so approximating "head" as the top slice
-// of the model is both cheap and accurate enough for this game's scale.
+// Headshots are decided against the rig's actual head bone (confirmed via
+// the GLB's node list — this is a Mixamo-style skeleton) rather than a
+// height-fraction guess: a shot counts if the mesh raycast's hit point
+// lands within this radius of the head bone's current (animated) world
+// position. Falls back to a height-fraction heuristic if the bone is ever
+// missing (e.g. a different model gets swapped in later).
+const HEAD_BONE_NAME = "mixamorig:Head_1";
+const HEAD_HIT_RADIUS = TARGET_HEIGHT * 0.15;
 const HEADSHOT_HEIGHT_FRACTION = 0.8;
 
 export interface RemotePlayerHandle {
   updateState: (position: Vec3, quaternion: Quat, moving: boolean) => void;
+  // Called when the server reports the opponent fired, so their avatar
+  // shows a muzzle flash — otherwise the only visible cue is a bullet
+  // tracer streaking past, and it's easy to miss that they shot at all.
+  muzzleFlash: () => void;
 }
 
 interface RemotePlayerProps {
@@ -33,10 +40,15 @@ interface RemotePlayerProps {
 export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({ health, onHit }, ref) => {
   const rigidBodyRef = useRef<RapierRigidBody>(null);
   const visualRef = useRef<THREE.Group>(null);
+  const flashLightRef = useRef<THREE.PointLight>(null);
+  const flashSpriteRef = useRef<THREE.Mesh>(null);
+  const flashTimer = useRef(0);
 
   const { scene, animations } = useGLTF(ENEMY_URL);
   const clonedScene = useMemo(() => cloneSkeleton(scene) as THREE.Group, [scene]);
   const { actions } = useAnimations(animations, visualRef);
+  const headBone = useMemo(() => clonedScene.getObjectByName(HEAD_BONE_NAME) ?? null, [clonedScene]);
+  const headWorldPos = useRef(new THREE.Vector3());
 
   const capsuleRadius = TARGET_HEIGHT * 0.12;
   const capsuleHalfHeight = Math.max(TARGET_HEIGHT * 0.5 - capsuleRadius, 0.02);
@@ -86,24 +98,43 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
       isMoving.current = moving;
       hasTarget.current = true;
     },
+    muzzleFlash: () => {
+      // Longer/brighter than a bot's (0.06s) — the duel opponent is the
+      // one thing in the scene the player is actively watching for this
+      // cue, so it needs to read clearly even against bright/outdoor
+      // lighting where a lone point light alone can wash out.
+      flashTimer.current = 0.1;
+      if (flashLightRef.current) flashLightRef.current.visible = true;
+      if (flashSpriteRef.current) flashSpriteRef.current.visible = true;
+    },
   }));
 
-  // Decide headshot vs. body shot from where the shot actually landed,
-  // relative to this avatar's current feet position (the RigidBody's own
-  // translation is the capsule center, not the feet — see the capsule
-  // math above for why TARGET_HEIGHT/2 recovers ground level).
+  // Decide headshot vs. body shot from where the shot actually landed:
+  // within HEAD_HIT_RADIUS of the head bone's live (animated) world
+  // position, falling back to the old height-fraction heuristic only if
+  // the bone lookup ever comes up empty. Returns the verdict too (not just
+  // reporting it via onHit) so the shooter's own RaycastShooter can show
+  // the right hitmarker immediately, without waiting on the server
+  // round-trip that onHit's message kicks off.
   const handleHitPoint = useCallback(
     (hitPoint: THREE.Vector3) => {
       const body = rigidBodyRef.current;
       if (!body) {
         onHit(false);
-        return;
+        return false;
       }
-      const feetY = body.translation().y - TARGET_HEIGHT / 2;
-      const headshot = hitPoint.y - feetY >= TARGET_HEIGHT * HEADSHOT_HEIGHT_FRACTION;
+      let headshot: boolean;
+      if (headBone) {
+        const headPos = headBone.getWorldPosition(headWorldPos.current);
+        headshot = hitPoint.distanceTo(headPos) <= HEAD_HIT_RADIUS;
+      } else {
+        const feetY = body.translation().y - TARGET_HEIGHT / 2;
+        headshot = hitPoint.y - feetY >= TARGET_HEIGHT * HEADSHOT_HEIGHT_FRACTION;
+      }
       onHit(headshot);
+      return headshot;
     },
-    [onHit]
+    [onHit, headBone]
   );
 
   const playAnim = (name: string, fade = 0.25) => {
@@ -152,6 +183,19 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
       visualRef.current.position.y = modelOffsetY;
     }
 
+    if (flashTimer.current > 0) {
+      flashTimer.current -= delta;
+      const stillFlashing = flashTimer.current > 0;
+      if (flashLightRef.current) flashLightRef.current.visible = stillFlashing;
+      if (flashSpriteRef.current) {
+        flashSpriteRef.current.visible = stillFlashing;
+        // The sprite is inside a Billboard (always faces camera) — jitter
+        // its in-plane rotation per flash so repeated shots don't look
+        // like the same static image blinking on and off.
+        flashSpriteRef.current.rotation.z = Math.random() * Math.PI * 2;
+      }
+    }
+
     // Smoothly chase the latest network sample rather than teleporting to
     // it — damp() gives a springy-but-stable follow that hides the gap
     // between network update ticks and the render's 60fps.
@@ -195,10 +239,37 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
       <group ref={visualRef} position={[0, modelOffsetY, 0]}>
         <primitive object={clonedScene} scale={modelScale} />
       </group>
-      <mesh position={[0, TARGET_HEIGHT + 0.16, 0]} renderOrder={998}>
-        <ringGeometry args={[0.05, 0.09, 20]} />
-        <meshBasicMaterial color="#ef4444" side={THREE.DoubleSide} depthTest={false} transparent opacity={0.9} />
-      </mesh>
+      <Billboard position={[0, TARGET_HEIGHT + 0.18, 0]}>
+        <Text
+          fontSize={0.075}
+          color="#ef4444"
+          anchorX="center"
+          anchorY="bottom"
+          outlineWidth={0.006}
+          outlineColor="#000000"
+          renderOrder={998}
+          material-depthTest={false}
+        >
+          Opponent
+        </Text>
+      </Billboard>
+      <pointLight
+        ref={flashLightRef}
+        position={[0, TARGET_HEIGHT * 0.75, 0]}
+        color="#fde047"
+        intensity={9}
+        distance={3}
+        visible={false}
+      />
+      {/* Unlit flash quad — the point light alone can wash out against
+          bright/outdoor lighting; this reads regardless of scene lighting
+          since meshBasicMaterial ignores it entirely. */}
+      <Billboard position={[0, TARGET_HEIGHT * 0.75, 0]}>
+        <mesh ref={flashSpriteRef} visible={false} renderOrder={999}>
+          <planeGeometry args={[0.16, 0.16]} />
+          <meshBasicMaterial color="#fff7c2" transparent opacity={0.95} depthTest={false} />
+        </mesh>
+      </Billboard>
     </RigidBody>
   );
 });
