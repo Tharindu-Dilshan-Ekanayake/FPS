@@ -37,6 +37,7 @@ import { loadGraphicsSettings, saveGraphicsSettings, type GraphicsSettings } fro
 import { Compass, CompassDriver, type CompassHandle } from "./Compass";
 import { EYE_HEIGHT } from "./playerConstants";
 import { RemotePlayer, type RemotePlayerHandle } from "./RemotePlayer";
+import { SceneErrorBoundary } from "./SceneErrorBoundary";
 import { GunXorLogo } from "./Logo";
 import {
   DuelConnection,
@@ -2100,7 +2101,14 @@ export default function App() {
           dataStyles={{ color: "#d4d4d4", fontFamily: "inherit" }}
         />
 
-        {/* 3D Scene Viewport */}
+        {/* 3D Scene Viewport — wrapped in an error boundary since a failed
+            asset load on a genuinely unstable connection throws past
+            Suspense (which only handles pending loads, not failures) and
+            would otherwise crash the whole app to a blank screen. React
+            error boundaries do catch errors thrown inside a Canvas's own
+            reconciler, as long as the boundary itself lives in the outer
+            tree — this is the standard, documented pattern for R3F. */}
+        <SceneErrorBoundary>
         <Canvas
           shadows={settings.shadows ? "percentage" : false}
           dpr={[Math.min(1, settings.resolutionScale), 1.5 * settings.resolutionScale]}
@@ -2150,7 +2158,14 @@ export default function App() {
           )}
 
           <Suspense fallback={null}>
-            <Physics gravity={[0, -9.81, 0]}>
+            {/* Physics keeps stepping (broadphase/collision, kinematic
+                character controllers) even for bodies that are just
+                standing frozen on the Match Over screen — nothing there
+                needs to move once a round has ended, so pausing the whole
+                simulation outside "playing" removes that cost entirely
+                instead of paying it while the player is just looking at a
+                results screen. */}
+            <Physics gravity={[0, -9.81, 0]} paused={gameState !== "playing"}>
               {gameState === "playing" && (
                 <Player
                   key={`player-${matchId}`}
@@ -2251,6 +2266,7 @@ export default function App() {
             </EffectComposer>
           )}
         </Canvas>
+        </SceneErrorBoundary>
     </div>
   );
 }
