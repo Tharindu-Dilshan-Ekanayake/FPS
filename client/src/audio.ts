@@ -13,6 +13,23 @@ function getAudioContext(): AudioContext {
   return audioCtx;
 }
 
+// Web Audio nodes stay attached to the processing graph — and keep costing
+// the audio thread cycles every quantum — until explicitly disconnected,
+// even long after their source has finished playing and .stop() was called.
+// Every play*Sound function below builds a short-lived node chain ending at
+// ctx.destination; without this, gunfire/footsteps/enemy shots (each firing
+// several times a second) leave thousands of dead nodes wired to
+// ctx.destination over a real match, and the audio thread grinding through
+// all of them is what turns a smooth start into the game crawling to a
+// couple of FPS the longer a session runs. This tears a chain down the
+// moment its source node fires "ended".
+function autoDisconnect(source: AudioScheduledSourceNode, ...nodes: AudioNode[]) {
+  source.onended = () => {
+    source.disconnect();
+    for (const n of nodes) n.disconnect();
+  };
+}
+
 // Small pool of pre-generated noise buffers, reused across every play*Sound
 // call instead of re-synthesizing (a fresh AudioBuffer allocation plus
 // thousands of Math.random() calls) on every single play. A shot or
@@ -72,6 +89,7 @@ export function playGunshotSound() {
 
     whiteNoise.start(now);
     whiteNoise.stop(now + 0.12);
+    autoDisconnect(whiteNoise, noiseFilter, noiseGain);
 
     // 2. Sub-Bass Punch (Low End Body / Thump)
     const subOsc = ctx.createOscillator();
@@ -89,6 +107,7 @@ export function playGunshotSound() {
 
     subOsc.start(now);
     subOsc.stop(now + 0.18);
+    autoDisconnect(subOsc, subGain);
 
     // 3. Mechanical crack transient (bolt/action snap for realism)
     const crackOsc = ctx.createOscillator();
@@ -102,6 +121,7 @@ export function playGunshotSound() {
     crackGain.connect(ctx.destination);
     crackOsc.start(now);
     crackOsc.stop(now + 0.025);
+    autoDisconnect(crackOsc, crackGain);
 
     // 4. Short slap-back tail (fake early reflection, adds body/space to the shot)
     const tailNoise = ctx.createBufferSource();
@@ -117,6 +137,7 @@ export function playGunshotSound() {
     tailGain.connect(ctx.destination);
     tailNoise.start(now + 0.05);
     tailNoise.stop(now + 0.16);
+    autoDisconnect(tailNoise, tailFilter, tailGain);
   } catch {
     // AudioContext permission or browser policy
   }
@@ -143,6 +164,7 @@ export function playEmptyClickSound() {
 
     osc.start(now);
     osc.stop(now + 0.04);
+    autoDisconnect(osc, gain);
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
@@ -166,6 +188,7 @@ export function playReloadSound() {
     gain1.connect(ctx.destination);
     osc1.start(now);
     osc1.stop(now + 0.1);
+    autoDisconnect(osc1, gain1);
 
     // Mag insert click (after 0.8s)
     const osc2 = ctx.createOscillator();
@@ -179,6 +202,7 @@ export function playReloadSound() {
     gain2.connect(ctx.destination);
     osc2.start(now + 0.8);
     osc2.stop(now + 0.95);
+    autoDisconnect(osc2, gain2);
 
     // Bolt rack slide (after 1.4s)
     const osc3 = ctx.createOscillator();
@@ -192,6 +216,7 @@ export function playReloadSound() {
     gain3.connect(ctx.destination);
     osc3.start(now + 1.4);
     osc3.stop(now + 1.55);
+    autoDisconnect(osc3, gain3);
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
@@ -218,6 +243,7 @@ export function playHitSound() {
 
     osc.start(now);
     osc.stop(now + 0.08);
+    autoDisconnect(osc, gain);
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
@@ -242,6 +268,7 @@ export function playHeadshotSound() {
     gain.connect(ctx.destination);
     osc.start(now);
     osc.stop(now + 0.14);
+    autoDisconnect(osc, gain);
 
     // Quiet overtone an octave up gives it a metallic "ping" quality
     // rather than a plain tone.
@@ -255,6 +282,7 @@ export function playHeadshotSound() {
     overtoneGain.connect(ctx.destination);
     overtone.start(now);
     overtone.stop(now + 0.09);
+    autoDisconnect(overtone, overtoneGain);
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
@@ -283,6 +311,7 @@ export function playFootstepSound() {
 
     noise.start(now);
     noise.stop(now + 0.07);
+    autoDisconnect(noise, filter, gain);
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
@@ -293,7 +322,6 @@ export function playJumpSound() {
   try {
     const ctx = getAudioContext();
     const now = ctx.currentTime;
-
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.type = "sine";
@@ -305,6 +333,7 @@ export function playJumpSound() {
     gain.connect(ctx.destination);
     osc.start(now);
     osc.stop(now + 0.12);
+    autoDisconnect(osc, gain);
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
@@ -329,6 +358,7 @@ export function playLandSound() {
     gain.connect(ctx.destination);
     noise.start(now);
     noise.stop(now + 0.1);
+    autoDisconnect(noise, filter, gain);
 
     const osc = ctx.createOscillator();
     const oGain = ctx.createGain();
@@ -340,13 +370,14 @@ export function playLandSound() {
     oGain.connect(ctx.destination);
     osc.start(now);
     osc.stop(now + 0.12);
+    autoDisconnect(osc, oGain);
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
 }
 
 // Ambient environment bed — soft filtered wind, loops quietly for atmosphere
-let ambientNodes: { source: AudioBufferSourceNode; gain: GainNode } | null = null;
+let ambientNodes: { source: AudioBufferSourceNode; gain: GainNode; filter: BiquadFilterNode } | null = null;
 
 export function startAmbientAmbience() {
   try {
@@ -383,7 +414,7 @@ export function startAmbientAmbience() {
     const now = ctx.currentTime;
     gain.gain.linearRampToValueAtTime(0.045, now + 2);
 
-    ambientNodes = { source, gain };
+    ambientNodes = { source, gain, filter };
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
@@ -391,11 +422,13 @@ export function startAmbientAmbience() {
 
 export function stopAmbientAmbience() {
   if (!ambientNodes) return;
+  const { source, gain, filter } = ambientNodes;
   try {
     const ctx = getAudioContext();
     const now = ctx.currentTime;
-    ambientNodes.gain.gain.linearRampToValueAtTime(0, now + 0.4);
-    ambientNodes.source.stop(now + 0.5);
+    gain.gain.linearRampToValueAtTime(0, now + 0.4);
+    source.stop(now + 0.5);
+    autoDisconnect(source, gain, filter);
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
@@ -426,6 +459,7 @@ export function playEnemyGunshotSound() {
     noiseGain.connect(ctx.destination);
     whiteNoise.start(now);
     whiteNoise.stop(now + 0.14);
+    autoDisconnect(whiteNoise, noiseFilter, noiseGain);
 
     const subOsc = ctx.createOscillator();
     const subGain = ctx.createGain();
@@ -438,6 +472,7 @@ export function playEnemyGunshotSound() {
     subGain.connect(ctx.destination);
     subOsc.start(now);
     subOsc.stop(now + 0.2);
+    autoDisconnect(subOsc, subGain);
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
@@ -463,6 +498,7 @@ export function playPlayerHurtSound() {
     gain.connect(ctx.destination);
     noise.start(now);
     noise.stop(now + 0.14);
+    autoDisconnect(noise, filter, gain);
 
     const osc = ctx.createOscillator();
     const oGain = ctx.createGain();
@@ -475,6 +511,7 @@ export function playPlayerHurtSound() {
     oGain.connect(ctx.destination);
     osc.start(now);
     osc.stop(now + 0.18);
+    autoDisconnect(osc, oGain);
   } catch {
     // Web Audio unavailable or blocked by browser policy
   }
