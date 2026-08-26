@@ -35,6 +35,14 @@ const WAYPOINT_RADIUS = 0.5;
 const LOW_HEALTH_FRACTION = 0.3;
 const GRAVITY = -18;
 
+// Beyond this, the name label is unreadable anyway and isn't worth its
+// render cost — the label (Billboard + SDF Text, depth-test disabled so it
+// draws through walls) is one of the few things that exists on every bot
+// but not on the player's own view, so with several bots on screen at once
+// it's a disproportionate cost specifically on the entities players watch
+// move, not on their own camera.
+const LABEL_VISIBLE_DIST_SQ = 14 * 14;
+
 // Headshots are decided against the rig's actual head bone (confirmed via
 // the GLB's node list — this is a Mixamo-style skeleton) rather than a
 // height-fraction guess: a shot counts if the mesh raycast's hit point
@@ -107,6 +115,7 @@ export function Bot({
   const visualRef = useRef<THREE.Group>(null);
   const flashLightRef = useRef<THREE.PointLight>(null);
   const flashSpriteRef = useRef<THREE.Mesh>(null);
+  const labelGroupRef = useRef<THREE.Group>(null);
   const cc = useRef<ReturnType<typeof world.createCharacterController> | null>(null);
 
   const preset = DIFFICULTY_PRESETS[difficulty];
@@ -252,7 +261,7 @@ export function Bot({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
-  useFrame((_state, delta) => {
+  useFrame((state, delta) => {
     const body = rigidBodyRef.current;
     if (!body || !cc.current) return;
 
@@ -261,6 +270,14 @@ export function Bot({
     if (myEntry) {
       myEntry.position.set(myPos.x, myPos.y, myPos.z);
       myEntry.alive = active && health > 0;
+    }
+
+    if (labelGroupRef.current) {
+      const camPos = state.camera.position;
+      const dx = myPos.x - camPos.x;
+      const dy = myPos.y - camPos.y;
+      const dz = myPos.z - camPos.z;
+      labelGroupRef.current.visible = dx * dx + dy * dy + dz * dz <= LABEL_VISIBLE_DIST_SQ;
     }
 
     if (health <= 0) {
@@ -499,21 +516,26 @@ export function Bot({
       {/* Name label — a Billboard (not a child of visualRef) so it always
           faces the camera instead of spinning with the bot's facing
           direction. Colored by team so it still doubles as the ally/enemy
-          cue the old ring gave in TDM. */}
-      <Billboard position={[0, TARGET_HEIGHT + 0.18, 0]}>
-        <Text
-          fontSize={0.075}
-          color={TEAM_COLOR[team]}
-          anchorX="center"
-          anchorY="bottom"
-          outlineWidth={0.006}
-          outlineColor="#000000"
-          renderOrder={998}
-          material-depthTest={false}
-        >
-          {displayName}
-        </Text>
-      </Billboard>
+          cue the old ring gave in TDM. Wrapped in a group whose visibility
+          is toggled by distance in useFrame — with several bots at once
+          this is one of the pricier per-bot extras (depth-test-disabled
+          transparent SDF text), and it's wasted past legible range anyway. */}
+      <group ref={labelGroupRef}>
+        <Billboard position={[0, TARGET_HEIGHT + 0.18, 0]}>
+          <Text
+            fontSize={0.075}
+            color={TEAM_COLOR[team]}
+            anchorX="center"
+            anchorY="bottom"
+            outlineWidth={0.006}
+            outlineColor="#000000"
+            renderOrder={998}
+            material-depthTest={false}
+          >
+            {displayName}
+          </Text>
+        </Billboard>
+      </group>
       <pointLight
         ref={flashLightRef}
         position={[0, TARGET_HEIGHT * 0.75, 0]}
