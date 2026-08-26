@@ -4,8 +4,8 @@ import { useGLTF, useAnimations, Billboard, Text } from "@react-three/drei";
 import { RigidBody, RapierRigidBody, CapsuleCollider } from "@react-three/rapier";
 import * as THREE from "three";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
-import { EYE_HEIGHT } from "./playerConstants";
-import type { Quat, Vec3 } from "./network";
+import { PLAYER_CAPSULE_HALF_HEIGHT, PLAYER_CAPSULE_RADIUS } from "./playerConstants";
+import type { Quat, Stance, Vec3 } from "./network";
 
 const ENEMY_URL = "/enime.glb"; // already preloaded by Bot.tsx
 
@@ -57,16 +57,32 @@ const INTERP_DELAY_MS = 100;
 // INTERP_DELAY_MS needs, just cheap insurance against the buffer growing
 // if updates ever stopped arriving.
 const MAX_SAMPLE_AGE_MS = 1000;
+// units/sec — comfortably below any real WASD movement speed (even
+// crouch-slowed movement is well over 1 unit/sec) and comfortably above
+// interpolation/rounding noise between samples from a genuinely
+// stationary sender. See its use below for why this exists.
+const MIN_MOVING_SPEED = 0.15;
 
 interface NetSample {
   t: number;
   pos: THREE.Vector3;
   quat: THREE.Quaternion;
   moving: boolean;
+  stance: Stance;
 }
 
 export interface RemotePlayerHandle {
-  updateState: (position: Vec3, quaternion: Quat, moving: boolean) => void;
+  // eyeHeight: the sender's own camera-above-capsule offset at the moment
+  // of this sample — varies with their stance (stand/crouch/prone), unlike
+  // a fixed constant. See updateState's use of it below for why a fixed
+  // EYE_HEIGHT here caused a crouching/prone opponent's legs to render
+  // sunk into the floor: their real offset is smaller than standing, so
+  // subtracting the full constant placed the reconstructed capsule too low
+  // by the difference. stance: which pose (stand/crouch/prone) to animate
+  // — this rig has no dedicated prone clip, so "prone" falls back to the
+  // crouch pose as the closest available match rather than staying on the
+  // standing/running animation regardless of actual posture.
+  updateState: (position: Vec3, quaternion: Quat, moving: boolean, eyeHeight: number, stance: Stance) => void;
   // Called when the server reports the opponent fired, so their avatar
   // shows a muzzle flash — otherwise the only visible cue is a bullet
   // tracer streaking past, and it's easy to miss that they shot at all.
@@ -93,8 +109,11 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
   const headWorldPos = useRef(new THREE.Vector3());
   const gunArmBone = useMemo(() => clonedScene.getObjectByName(GUN_ARM_BONE_NAME) ?? null, [clonedScene]);
 
-  const capsuleRadius = TARGET_HEIGHT * 0.12;
-  const capsuleHalfHeight = Math.max(TARGET_HEIGHT * 0.5 - capsuleRadius, 0.02);
+  // Must match the real Player's own CapsuleCollider (App.tsx), not a
+  // TARGET_HEIGHT-derived guess — see playerConstants.ts's comment for why
+  // that mismatch was sinking the model into the ground.
+  const capsuleRadius = PLAYER_CAPSULE_RADIUS;
+  const capsuleHalfHeight = PLAYER_CAPSULE_HALF_HEIGHT;
   const { modelScale, modelOffsetY } = useMemo(() => {
     const box = new THREE.Box3().setFromObject(clonedScene);
     const rawHeight = Math.max(box.max.y - box.min.y, 0.001);
@@ -121,6 +140,7 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
   // on-screen motion resiliently, jitter or not.
   const samples = useRef<NetSample[]>([]);
   const isMoving = useRef(false);
+  const stanceRef = useRef<Stance>("stand");
   const hasTarget = useRef(false);
   const currentAnim = useRef<string | null>(null);
   // Scratch objects the interpolation writes into each frame — avoids
@@ -136,17 +156,19 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
   const DEATH_FALL_SECONDS = 0.5;
 
   useImperativeHandle(ref, () => ({
-    updateState: (position, quaternion, moving) => {
+    updateState: (position, quaternion, moving, eyeHeight, stance) => {
       // The network payload is the sender's CAMERA position (see Player in
-      // App.tsx); subtract EYE_HEIGHT to recover the capsule-center height
-      // this rig's own proportions expect (see Bot.tsx's identical note).
+      // App.tsx); subtract their actual reported eyeHeight (not a fixed
+      // constant — it shrinks when they crouch/prone) to recover the
+      // capsule-center height this rig's own proportions expect.
       const now = performance.now();
       const buf = samples.current;
       buf.push({
         t: now,
-        pos: new THREE.Vector3(position[0], position[1] - EYE_HEIGHT, position[2]),
+        pos: new THREE.Vector3(position[0], position[1] - eyeHeight, position[2]),
         quat: new THREE.Quaternion(quaternion[0], quaternion[1], quaternion[2], quaternion[3]),
         moving,
+        stance,
       });
       const cutoff = now - MAX_SAMPLE_AGE_MS;
       while (buf.length > 2 && buf[0].t < cutoff) buf.shift();
@@ -271,10 +293,12 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
     const buf = samples.current;
     const renderTime = performance.now() - INTERP_DELAY_MS;
     let moving: boolean;
+    let stance: Stance;
     if (buf.length === 1 || renderTime <= buf[0].t) {
       interpPos.current.copy(buf[0].pos);
       interpQuat.current.copy(buf[0].quat);
       moving = buf[0].moving;
+      stance = buf[0].stance;
     } else if (renderTime >= buf[buf.length - 1].t) {
       // No fresher sample yet — hold at the latest known one rather than
       // extrapolating past real data.
@@ -282,6 +306,7 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
       interpPos.current.copy(last.pos);
       interpQuat.current.copy(last.quat);
       moving = last.moving;
+      stance = last.stance;
     } else {
       let i = buf.length - 2;
       while (i > 0 && buf[i].t > renderTime) i--;
@@ -292,8 +317,29 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
       interpPos.current.lerpVectors(a.pos, b.pos, frac);
       interpQuat.current.slerpQuaternions(a.quat, b.quat, frac);
       moving = frac < 0.5 ? a.moving : b.moving;
+      stance = frac < 0.5 ? a.stance : b.stance;
     }
+
+    // Back the sender's own moving flag with an actual measured speed —
+    // this can't play the crouch-WALK clip for someone who measurably
+    // isn't translating, regardless of what caused the flag to disagree
+    // (reported: crouching in place still showed Rifle_crouch, the
+    // moving variant, instead of the stationary Crouch pose). Measured
+    // from the two most recent REAL samples, not per-render-frame
+    // interpolated positions, so it's stable across frames rather than
+    // noisy from interpolation/rounding jitter.
+    if (buf.length >= 2) {
+      const recentA = buf[buf.length - 2];
+      const recentB = buf[buf.length - 1];
+      const recentSpanSec = (recentB.t - recentA.t) / 1000;
+      if (recentSpanSec > 0) {
+        const measuredSpeed = recentA.pos.distanceTo(recentB.pos) / recentSpanSec;
+        if (measuredSpeed < MIN_MOVING_SPEED) moving = false;
+      }
+    }
+
     isMoving.current = moving;
+    stanceRef.current = stance;
     body.setNextKinematicTranslation(interpPos.current);
 
     // Only the horizontal facing (yaw) drives the body mesh — same as
@@ -311,7 +357,17 @@ export const RemotePlayer = forwardRef<RemotePlayerHandle, RemotePlayerProps>(({
       visualRef.current.rotation.y = curYaw + diff * Math.min(1, delta * 10);
     }
 
-    playAnim(moving ? "Rifle_run" : "Rifle_stand");
+    // Same clip choice Bot.tsx uses for its own crouch-while-retreating
+    // pose. No dedicated prone clip exists on this rig (confirmed via its
+    // clip list — Crouch/Idle/Rifle_crouch/Rifle_run/Rifle_stand/Run/Walk,
+    // nothing prone-shaped), so "prone" falls back to the crouch pose —
+    // still shows a lowered stance instead of standing tall while their
+    // reconstructed body sits at prone height.
+    if (stance === "crouch" || stance === "prone") {
+      playAnim(moving ? "Rifle_crouch" : "Crouch");
+    } else {
+      playAnim(moving ? "Rifle_run" : "Rifle_stand");
+    }
   });
 
   return (

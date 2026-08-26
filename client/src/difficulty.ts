@@ -16,7 +16,7 @@ export const DIFFICULTY_PRESETS: Record<
   easy: {
     label: "Easy",
     description: "Slow to react, wide aim — a forgiving warm-up bot.",
-    moveSpeed: 1.4,
+    moveSpeed: 1.0,
     fireInterval: 1.7,
     fireJitter: 0.6,
     accuracy: 0.4,
@@ -26,7 +26,7 @@ export const DIFFICULTY_PRESETS: Record<
   medium: {
     label: "Medium",
     description: "Balanced aim and pace — a fair 1v1 fight.",
-    moveSpeed: 2.0,
+    moveSpeed: 1.5,
     fireInterval: 1.15,
     fireJitter: 0.4,
     accuracy: 0.62,
@@ -36,7 +36,7 @@ export const DIFFICULTY_PRESETS: Record<
   hard: {
     label: "Hard",
     description: "Fast reflexes, tight aim — a real duel.",
-    moveSpeed: 2.6,
+    moveSpeed: 2.0,
     fireInterval: 0.75,
     fireJitter: 0.25,
     accuracy: 0.82,

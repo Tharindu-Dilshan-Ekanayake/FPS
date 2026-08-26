@@ -41,9 +41,19 @@ export const MAX_TIME_LIMIT_SECONDS = 3600;
 // two spots. Keep this equal to DUEL_SPAWN_PAIRS.length on the client.
 export const DUEL_SPAWN_PAIR_COUNT = 6;
 
+export type Stance = "stand" | "crouch" | "prone";
+
 export type ClientMessage =
   | { type: "find_match"; roomCode?: string; killLimit?: number; timeLimitSeconds?: number }
-  | { type: "state"; position: Vec3; quaternion: Quat; moving: boolean }
+  // eyeHeight: how far above their own capsule center the sender's camera
+  // currently sits — varies with stance (stand/crouch/prone), unlike a
+  // fixed constant. Without it, the receiver has no way to tell a crouching
+  // opponent's reported camera height from a standing one's, and ends up
+  // reconstructing their body position too low (see RemotePlayer.tsx).
+  // stance: lets the receiver play the right pose (Crouch/Rifle_crouch)
+  // instead of always showing the standing/running animation regardless of
+  // the sender's actual posture.
+  | { type: "state"; position: Vec3; quaternion: Quat; moving: boolean; eyeHeight: number; stance: Stance }
   | { type: "shoot"; from: Vec3; to: Vec3 }
   | { type: "hit"; headshot: boolean }
   | { type: "leave" };
@@ -53,7 +63,7 @@ export type MatchEndReason = "killLimit" | "timeLimit" | "opponentDisconnected";
 export type ServerMessage =
   | { type: "queued"; roomCode?: string }
   | { type: "matched"; isPlayerOne: boolean; killLimit: number; timeLimitSeconds: number; spawnIndex: number }
-  | { type: "opponent_state"; position: Vec3; quaternion: Quat; moving: boolean }
+  | { type: "opponent_state"; position: Vec3; quaternion: Quat; moving: boolean; eyeHeight: number; stance: Stance }
   | { type: "opponent_shot"; from: Vec3; to: Vec3 }
   // Sent to the shooter right after a hit lands.
   | {

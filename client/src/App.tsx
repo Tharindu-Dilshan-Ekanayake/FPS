@@ -35,7 +35,7 @@ import {
 import { GraphicsSettingsPanel } from "./Settings";
 import { loadGraphicsSettings, saveGraphicsSettings, type GraphicsSettings } from "./graphicsSettings";
 import { Compass, CompassDriver, type CompassHandle } from "./Compass";
-import { EYE_HEIGHT } from "./playerConstants";
+import { EYE_HEIGHT, PLAYER_CAPSULE_HALF_HEIGHT, PLAYER_CAPSULE_RADIUS } from "./playerConstants";
 import { RemotePlayer, type RemotePlayerHandle } from "./RemotePlayer";
 import { SceneErrorBoundary } from "./SceneErrorBoundary";
 import { GunXorLogo } from "./Logo";
@@ -44,6 +44,7 @@ import {
   type DuelStatus,
   type PlayerStats,
   type MatchEndReason as DuelMatchEndReason,
+  type Stance,
 } from "./network";
 
 type GameState = "menu" | "playing" | "won" | "lost" | "draw";
@@ -52,18 +53,20 @@ type GameState = "menu" | "playing" | "won" | "lost" | "draw";
 //  TUNING CONSTANTS (Adjusted for scale={0.16} GameMap)
 // ──────────────────────────────────────────────────────
 // The player capsule is ~0.5 units tall (see Bot.tsx's TARGET_HEIGHT, which
-// matches it). The old 4.5/5.5 values covered ~9x that height per second of
-// walking and jumped ~1.7x the player's own height, which felt wildly fast
-// and floaty for how small the map actually is — these are scaled back down
-// to a believable, controllable pace instead (still a bit quicker than the
-// toughest bot's own moveSpeed, see difficulty.ts).
-const MOVE_SPEED = 3.0;
+// matches it). Cut again from an earlier pass (was 3.0) — still felt too
+// fast for how small the map is, even after the first reduction. Bots
+// (difficulty.ts) were reduced by the same proportion so the player still
+// keeps a reasonable edge in pace over the toughest bot.
+const MOVE_SPEED = 2.2;
 const JUMP_FORCE = 3.4;
 const GRAVITY = -18;
 const CROUCH_HEIGHT = EYE_HEIGHT * 0.6;
 const PRONE_HEIGHT = EYE_HEIGHT * 0.22;
-const CROUCH_SPEED_MULT = 0.55;
-const PRONE_SPEED_MULT = 0.28;
+// Crouch is now a deliberately slow, careful pace rather than "walking but
+// a bit slower" — reads more like actually crouch-creeping. Prone nudged
+// down to match, since it should read as the slowest of the two.
+const CROUCH_SPEED_MULT = 0.4;
+const PRONE_SPEED_MULT = 0.2;
 
 // Spread across the map's real footprint (see Bot.tsx's WANDER bounds),
 // away from the player's spawn near the origin.
@@ -150,7 +153,13 @@ interface PlayerProps {
   // Duel mode only — throttled (not every frame) so the network isn't fed
   // 60 updates/sec for something a 15-20Hz tick already reads smoothly
   // once RemotePlayer interpolates between samples.
-  onNetworkTick?: (position: [number, number, number], quaternion: [number, number, number, number], moving: boolean) => void;
+  // eyeHeight: this player's current camera-above-capsule offset (varies
+  // with stance — see the call site in useFrame below), so the receiving
+  // client can reconstruct the sender's actual body height instead of
+  // assuming they're always standing. stance: lets the opponent play the
+  // matching Crouch/Rifle_crouch pose instead of always looking like
+  // they're standing/running.
+  onNetworkTick?: (position: [number, number, number], quaternion: [number, number, number, number], moving: boolean, eyeHeight: number, stance: Stance) => void;
 }
 
 export interface PlayerHandle {
@@ -353,7 +362,9 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
         onNetworkTick(
           [camPos.x, camPos.y, camPos.z],
           [camQuat.x, camQuat.y, camQuat.z, camQuat.w],
-          currentlyMoving
+          currentlyMoving,
+          eyeHeightRef.current,
+          stanceRef.current
         );
       }
     }
@@ -389,7 +400,7 @@ const Player = forwardRef<PlayerHandle, PlayerProps>(function Player(
       enabledRotations={[false, false, false]}
       canSleep={false}
     >
-      <CapsuleCollider args={[0.06, 0.06]} friction={0} restitution={0} />
+      <CapsuleCollider args={[PLAYER_CAPSULE_HALF_HEIGHT, PLAYER_CAPSULE_RADIUS]} friction={0} restitution={0} />
     </RigidBody>
   );
 });
@@ -1193,8 +1204,8 @@ export default function App() {
         setMatchId((id) => id + 1);
         setGameState("playing");
       },
-      onOpponentState: (position, quaternion, moving) => {
-        remotePlayerRef.current?.updateState(position, quaternion, moving);
+      onOpponentState: (position, quaternion, moving, eyeHeight, stance) => {
+        remotePlayerRef.current?.updateState(position, quaternion, moving, eyeHeight, stance);
       },
       onOpponentShot: (from, to) => {
         bulletEffectsRef.current?.addShot(
@@ -1253,8 +1264,8 @@ export default function App() {
   }, []);
 
   const handleDuelNetworkTick = useCallback(
-    (position: [number, number, number], quaternion: [number, number, number, number], moving: boolean) => {
-      duelConnectionRef.current?.sendState(position, quaternion, moving);
+    (position: [number, number, number], quaternion: [number, number, number, number], moving: boolean, eyeHeight: number, stance: Stance) => {
+      duelConnectionRef.current?.sendState(position, quaternion, moving, eyeHeight, stance);
     },
     []
   );

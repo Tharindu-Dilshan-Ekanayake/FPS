@@ -136,6 +136,8 @@ function handleMessage(player: Player, raw: string) {
         position: msg.position,
         quaternion: msg.quaternion,
         moving: msg.moving,
+        eyeHeight: msg.eyeHeight,
+        stance: msg.stance,
       });
       break;
     }

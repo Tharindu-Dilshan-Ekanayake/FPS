@@ -8,8 +8,11 @@
 // damage/kill and tells both sides what happened. The client no longer
 // self-reports its own health.
 
+import { EYE_HEIGHT } from "./playerConstants";
+
 export type Vec3 = [number, number, number];
 export type Quat = [number, number, number, number];
+export type Stance = "stand" | "crouch" | "prone";
 
 export interface PlayerStats {
   kills: number;
@@ -27,7 +30,12 @@ export interface DuelCallbacks {
   // code (see connect()) — undefined for anonymous quick-match.
   onQueued?: (roomCode?: string) => void;
   onMatched?: (isPlayerOne: boolean, killLimit: number, timeLimitSeconds: number, spawnIndex: number) => void;
-  onOpponentState?: (position: Vec3, quaternion: Quat, moving: boolean) => void;
+  // eyeHeight: the sender's current camera-above-capsule offset (varies
+  // with stance — see sendState's comment). Needed to correctly place the
+  // opponent's body, not just their camera. stance: lets the receiver play
+  // the matching Crouch/Rifle_crouch pose instead of always showing them
+  // standing/running regardless of their real posture.
+  onOpponentState?: (position: Vec3, quaternion: Quat, moving: boolean, eyeHeight: number, stance: Stance) => void;
   onOpponentShot?: (from: Vec3, to: Vec3) => void;
   // We landed a hit on the opponent.
   onHitResult?: (headshot: boolean, damage: number, killed: boolean, yourStats: PlayerStats, opponentStats: PlayerStats, opponentHealth: number) => void;
@@ -73,6 +81,11 @@ export class DuelConnection {
   // joining a code someone else already opened — see server/src/index.ts).
   connect(roomCode?: string, killLimit?: number, timeLimitSeconds?: number) {
     if (this.socket) return;
+    // Logged because "which server is this actually hitting" (Bonto vs.
+    // localhost) has been a recurring source of confusion — this is a
+    // ~free way to confirm it directly from the browser console instead of
+    // guessing from symptoms.
+    console.log(`[duel] connecting to ${this.url}`);
     this.callbacks.onStatusChange?.("connecting");
     const socket = new WebSocket(this.url);
     this.socket = socket;
@@ -115,6 +128,8 @@ export class DuelConnection {
       position?: Vec3;
       quaternion?: Quat;
       moving?: boolean;
+      eyeHeight?: number;
+      stance?: Stance;
       from?: Vec3;
       to?: Vec3;
       headshot?: boolean;
@@ -153,7 +168,16 @@ export class DuelConnection {
         break;
       case "opponent_state":
         if (msg.position && msg.quaternion) {
-          this.callbacks.onOpponentState?.(msg.position, msg.quaternion, !!msg.moving);
+          // Fallbacks only guard a version mismatch (client/server deployed
+          // out of sync) — both ship together in practice, so eyeHeight and
+          // stance should always be present.
+          this.callbacks.onOpponentState?.(
+            msg.position,
+            msg.quaternion,
+            !!msg.moving,
+            msg.eyeHeight ?? EYE_HEIGHT,
+            msg.stance ?? "stand"
+          );
         }
         break;
       case "opponent_shot":
@@ -191,13 +215,20 @@ export class DuelConnection {
     }
   }
 
-  sendState(position: Vec3, quaternion: Quat, moving: boolean) {
+  sendState(position: Vec3, quaternion: Quat, moving: boolean, eyeHeight: number, stance: Stance) {
     // Rounded to keep the JSON payload compact — this is a text protocol
     // (not a packed binary one) so there's no fixed byte budget to hit,
     // but full float64 precision (~17 significant digits) buys nothing
     // for a value that's about to be damp()-interpolated on the other end
     // anyway, and it roughly halves the digits sent per number.
-    this.send({ type: "state", position: roundVec3(position), quaternion: roundQuat(quaternion), moving });
+    this.send({
+      type: "state",
+      position: roundVec3(position),
+      quaternion: roundQuat(quaternion),
+      moving,
+      eyeHeight: round(eyeHeight, 3),
+      stance,
+    });
   }
 
   sendShot(from: Vec3, to: Vec3) {
