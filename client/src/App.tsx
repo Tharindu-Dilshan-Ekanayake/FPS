@@ -50,8 +50,14 @@ type GameState = "menu" | "playing" | "won" | "lost" | "draw";
 // ──────────────────────────────────────────────────────
 //  TUNING CONSTANTS (Adjusted for scale={0.16} GameMap)
 // ──────────────────────────────────────────────────────
-const MOVE_SPEED = 4.5;
-const JUMP_FORCE = 5.5;
+// The player capsule is ~0.5 units tall (see Bot.tsx's TARGET_HEIGHT, which
+// matches it). The old 4.5/5.5 values covered ~9x that height per second of
+// walking and jumped ~1.7x the player's own height, which felt wildly fast
+// and floaty for how small the map actually is — these are scaled back down
+// to a believable, controllable pace instead (still a bit quicker than the
+// toughest bot's own moveSpeed, see difficulty.ts).
+const MOVE_SPEED = 3.0;
+const JUMP_FORCE = 3.4;
 const GRAVITY = -18;
 const CROUCH_HEIGHT = EYE_HEIGHT * 0.6;
 const PRONE_HEIGHT = EYE_HEIGHT * 0.22;
@@ -76,6 +82,20 @@ const ALLY_SPAWN_POINTS: [number, number, number][] = [
   [2.4, 2, 3.2],
 ];
 const MAX_TEAM_SIZE = ALLY_SPAWN_POINTS.length + 1; // + the player
+
+// FFA/TDM bots respawn instead of staying dead — matches are meant to run
+// to the kill limit (or time limit), not end the moment however many bots
+// were on the map at once happen to all be dead simultaneously.
+const RESPAWN_DELAY_MS = 3000;
+
+// Picks a spawn point index different from the one just used, so a
+// respawning bot doesn't reappear exactly where it died.
+function pickRespawnSpawnIndex(current: number, poolSize: number): number {
+  if (poolSize <= 1) return 0;
+  let next = Math.floor(Math.random() * poolSize);
+  while (next === current) next = Math.floor(Math.random() * poolSize);
+  return next;
+}
 
 // 1v1 duel arena. The x=-4 lane was chosen by actually ray-casting it
 // against the map's collision geometry (not eyeballed) — the x=0 corridor
@@ -451,7 +471,7 @@ function ShootableTarget({ position, color }: TargetProps) {
 interface RaycastShooterProps {
   onRegisterShot: (fn: (muzzlePos: THREE.Vector3) => void) => void;
   bulletEffectsRef: React.RefObject<BulletEffectsHandle | null>;
-  onTargetHit: () => void;
+  onTargetHit: (headshot: boolean) => void;
   // Duel mode only — lets the opponent see this shot's tracer too.
   onShotFired?: (from: THREE.Vector3, to: THREE.Vector3) => void;
 }
@@ -468,11 +488,22 @@ function isWeaponDescendant(obj: THREE.Object3D): boolean {
   return false;
 }
 
+// Right-click hold zooms the aim in; releasing eases it back out. Expressed
+// as a fraction of the resting FOV, applied to the same `baseFov` the shot
+// recoil "punch" below already eases the camera toward every frame — so
+// aiming in and out both animate for free through that existing damp(),
+// instead of needing a second FOV chase.
+const AIM_ZOOM_FOV_MULT = 0.7;
+
 function RaycastShooter({ onRegisterShot, bulletEffectsRef, onTargetHit, onShotFired }: RaycastShooterProps) {
   const { scene } = useThree();
   const store = useStore();
   const raycaster = useRef(new THREE.Raycaster());
   const baseFov = useRef((store.getState().camera as THREE.PerspectiveCamera).fov);
+  // The un-zoomed resting FOV, captured once — baseFov itself now flips
+  // between this and the zoomed value while aiming (see the mouse listeners
+  // below), rather than always being the fixed rest value.
+  const restFov = useRef((store.getState().camera as THREE.PerspectiveCamera).fov);
   const centerNdc = useRef(new THREE.Vector2(0, 0));
   const farPointVec = useRef(new THREE.Vector3());
 
@@ -530,15 +561,17 @@ function RaycastShooter({ onRegisterShot, bulletEffectsRef, onTargetHit, onShotF
         onShotFired?.(muzzlePos, hitPoint);
 
         // Check if target was hit. hitPoint is passed through for targets
-        // that care where exactly they were hit (RemotePlayer uses it for
-        // headshot detection) — Bot/ShootableTarget's onHit takes no
-        // arguments and simply ignores it.
+        // that care where exactly they were hit — Bot/RemotePlayer use it
+        // for headshot detection and report the verdict back via onHit's
+        // return value, so the hitmarker/sound can react immediately
+        // instead of waiting on anything async. ShootableTarget's onHit
+        // takes no arguments and returns nothing, which reads as "not a
+        // headshot" below.
         let currentObj: THREE.Object3D | null = hit.object;
         while (currentObj) {
           if (currentObj.userData?.isTarget) {
-            currentObj.userData.onHit?.(hitPoint);
-            playHitSound();
-            onTargetHit();
+            const headshot = !!currentObj.userData.onHit?.(hitPoint);
+            onTargetHit(headshot);
             break;
           }
           currentObj = currentObj.parent;
@@ -556,6 +589,38 @@ function RaycastShooter({ onRegisterShot, bulletEffectsRef, onTargetHit, onShotF
   useEffect(() => {
     onRegisterShot(shootRay);
   }, [shootRay, onRegisterShot]);
+
+  // Right-click-hold aim zoom. Only the target (baseFov) changes here — the
+  // useFrame damp() above does the actual smooth in/out animation either
+  // way, so releasing eases back to normal instead of snapping.
+  useEffect(() => {
+    const setAiming = (aiming: boolean) => {
+      baseFov.current = aiming ? restFov.current * AIM_ZOOM_FOV_MULT : restFov.current;
+    };
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button === 2 && document.pointerLockElement) setAiming(true);
+    };
+    const onMouseUp = (e: MouseEvent) => {
+      if (e.button === 2) setAiming(false);
+    };
+    // Right-click would otherwise pop the browser's context menu.
+    const onContextMenu = (e: MouseEvent) => e.preventDefault();
+    // Losing pointer lock mid-aim (Esc, alt-tab) would otherwise leave the
+    // camera stuck zoomed in with no mouseup ever coming.
+    const onPointerLockChange = () => {
+      if (!document.pointerLockElement) setAiming(false);
+    };
+    window.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("contextmenu", onContextMenu);
+    document.addEventListener("pointerlockchange", onPointerLockChange);
+    return () => {
+      window.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("contextmenu", onContextMenu);
+      document.removeEventListener("pointerlockchange", onPointerLockChange);
+    };
+  }, []);
 
   return null;
 }
@@ -664,6 +729,10 @@ export default function App() {
   const [playerHealth, setPlayerHealth] = useState(100);
   const [botHealths, setBotHealths] = useState<number[]>([]); // enemy team
   const [allyHealths, setAllyHealths] = useState<number[]>([]); // TDM only
+  // Which ENEMY_SPAWN_POINTS/ALLY_SPAWN_POINTS index each bot slot currently
+  // uses — reassigned to a different point each time that slot respawns.
+  const [botSpawnIndices, setBotSpawnIndices] = useState<number[]>([]);
+  const [allySpawnIndices, setAllySpawnIndices] = useState<number[]>([]);
   const [friendlyKills, setFriendlyKills] = useState(0);
   const [enemyKills, setEnemyKills] = useState(0);
   const [matchElapsed, setMatchElapsed] = useState(0);
@@ -693,8 +762,20 @@ export default function App() {
   const timeUpProcessedRef = useRef(false);
   const botHealthsRef = useRef<number[]>([]);
   const allyHealthsRef = useRef<number[]>([]);
+  const botSpawnIndicesRef = useRef<number[]>([]);
+  const allySpawnIndicesRef = useRef<number[]>([]);
   const friendlyKillsRef = useRef(0);
   const enemyKillsRef = useRef(0);
+  const playerHealthRef = useRef(100);
+  // Guards pending respawn timeouts: a timeout only applies its revive if
+  // it's still the same match and the match is still actually being played
+  // (not the "Match Over" screen, which keeps rendering bots at h > 0 but
+  // freezes their AI — see Bot.tsx's `active` check).
+  const matchIdRef = useRef(0);
+  const gameStateRef = useRef<GameState>("menu");
+  useEffect(() => {
+    gameStateRef.current = gameState;
+  }, [gameState]);
   useEffect(() => {
     scoreLimitRef.current = scoreLimit;
   }, [scoreLimit]);
@@ -736,15 +817,22 @@ export default function App() {
   const startMatch = useCallback(
     (diff: Difficulty) => {
       setDifficulty(diff);
+      playerHealthRef.current = 100;
       setPlayerHealth(100);
       const initialEnemies = Array(enemyCount).fill(100);
       const initialAllies = Array(allyCount).fill(100);
+      const initialBotSpawnIndices = Array.from({ length: enemyCount }, (_, i) => i % ENEMY_SPAWN_POINTS.length);
+      const initialAllySpawnIndices = Array.from({ length: allyCount }, (_, i) => i % ALLY_SPAWN_POINTS.length);
       botHealthsRef.current = initialEnemies;
       allyHealthsRef.current = initialAllies;
+      botSpawnIndicesRef.current = initialBotSpawnIndices;
+      allySpawnIndicesRef.current = initialAllySpawnIndices;
       friendlyKillsRef.current = 0;
       enemyKillsRef.current = 0;
       setBotHealths(initialEnemies);
       setAllyHealths(initialAllies);
+      setBotSpawnIndices(initialBotSpawnIndices);
+      setAllySpawnIndices(initialAllySpawnIndices);
       setFriendlyKills(0);
       setEnemyKills(0);
       setMatchElapsed(0);
@@ -755,7 +843,8 @@ export default function App() {
       setMatchEndReason(null);
       suddenDeathActiveRef.current = false;
       timeUpProcessedRef.current = false;
-      setMatchId((id) => id + 1);
+      matchIdRef.current += 1;
+      setMatchId(matchIdRef.current);
       setGameState("playing");
     },
     [enemyCount, allyCount]
@@ -818,24 +907,98 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [gameState]);
 
-  const handleDamagePlayer = useCallback((dmg: number) => {
-    setPlayerHealth((h) => {
-      const next = Math.max(0, h - dmg);
-      if (next <= 0) {
-        setMatchEndReason("defeated");
-        setGameState((gs) => (gs === "playing" ? "lost" : gs));
-      }
-      return next;
-    });
-    setDamageFlash(true);
-    window.setTimeout(() => setDamageFlash(false), 200);
-    playPlayerHurtSound();
-  }, []);
+  // FFA/TDM only (duel's own health comes straight from the server via
+  // onDamaged, never through this path — see startDuelMatch). Dying here
+  // works just like a bot dying: the player respawns and the match keeps
+  // running, ending only via the kill limit or time limit, same as real
+  // deathmatch/TDM — not the instant "you lose" a single death used to cause.
+  const handleDamagePlayer = useCallback(
+    (dmg: number) => {
+      if (playerHealthRef.current <= 0) return; // already down, respawn pending
+      const next = Math.max(0, playerHealthRef.current - dmg);
+      playerHealthRef.current = next;
+      setPlayerHealth(next);
+      setDamageFlash(true);
+      window.setTimeout(() => setDamageFlash(false), 200);
+      playPlayerHurtSound();
 
-  // Enemy-team bot took damage (from the player's own raycast, or from an
-  // ally bot's attack via the combat registry).
+      if (next > 0) return;
+
+      pushKillFeed("You were eliminated", "bad");
+      const playerEntry = registry.get("player");
+      if (playerEntry) playerEntry.alive = false;
+
+      if (modeRef.current === "tdm") {
+        enemyKillsRef.current += 1;
+        setEnemyKills(enemyKillsRef.current);
+
+        if (suddenDeathActiveRef.current) {
+          setMatchEndReason("killLimit");
+          setGameState((gs) => (gs === "playing" ? "lost" : gs));
+          return;
+        }
+        const limit = scoreLimitRef.current;
+        if (limit > 0 && enemyKillsRef.current >= limit) {
+          setMatchEndReason("killLimit");
+          setGameState((gs) => (gs === "playing" ? "lost" : gs));
+          return;
+        }
+      }
+
+      const forMatchId = matchIdRef.current;
+      window.setTimeout(() => {
+        if (matchIdRef.current !== forMatchId || gameStateRef.current !== "playing") return;
+        playerHealthRef.current = 100;
+        setPlayerHealth(100);
+        const entry = registry.get("player");
+        if (entry) entry.alive = true;
+        playerRef.current?.respawn([0, 1.5, 0]);
+      }, RESPAWN_DELAY_MS);
+    },
+    [pushKillFeed, registry]
+  );
+
+  // Brings a dead bot slot back to full health at a freshly-picked spawn
+  // point after RESPAWN_DELAY_MS, as long as the match is still the one
+  // that killed it and is still actually in progress. Shared by the enemy
+  // and ally sides — both respawn the same way, just into different pools.
+  const scheduleRespawn = useCallback(
+    (
+      index: number,
+      healthRef: React.MutableRefObject<number[]>,
+      setHealth: React.Dispatch<React.SetStateAction<number[]>>,
+      spawnIndexRef: React.MutableRefObject<number[]>,
+      setSpawnIndex: React.Dispatch<React.SetStateAction<number[]>>,
+      spawnPointCount: number,
+      forMatchId: number
+    ) => {
+      window.setTimeout(() => {
+        if (matchIdRef.current !== forMatchId || gameStateRef.current !== "playing") return;
+        const health = healthRef.current;
+        if (index >= health.length || health[index] > 0) return;
+
+        const nextHealth = health.slice();
+        nextHealth[index] = 100;
+        healthRef.current = nextHealth;
+        setHealth(nextHealth);
+
+        const spawnIndices = spawnIndexRef.current;
+        const nextSpawnIndices = spawnIndices.slice();
+        nextSpawnIndices[index] = pickRespawnSpawnIndex(spawnIndices[index] ?? 0, spawnPointCount);
+        spawnIndexRef.current = nextSpawnIndices;
+        setSpawnIndex(nextSpawnIndices);
+      }, RESPAWN_DELAY_MS);
+    },
+    []
+  );
+
+  // Enemy-team bot took damage — from the player's own raycast (no
+  // attackerId), an ally bot's attack, or in FFA another enemy bot (bots
+  // there are hostile to everyone, including each other — see Bot.tsx's
+  // freeForAll targeting). Only a kill the player or their own team
+  // actually landed should count toward the player's score/win condition.
   const handleHitBot = useCallback(
-    (index: number, dmg: number) => {
+    (index: number, dmg: number, attackerId?: string, headshot?: boolean) => {
       const arr = botHealthsRef.current;
       const prevHealth = arr[index] ?? 0;
       if (prevHealth <= 0) return;
@@ -846,31 +1009,46 @@ export default function App() {
       setBotHealths(nextArr);
 
       if (nextHealth <= 0) {
-        pushKillFeed(`You eliminated Enemy ${index + 1}`, "good");
-        friendlyKillsRef.current += 1;
-        setFriendlyKills(friendlyKillsRef.current);
+        const creditsPlayer = attackerId === undefined || attackerId.startsWith("ally-");
+        if (creditsPlayer) {
+          pushKillFeed(headshot ? `Headshot — you eliminated Enemy ${index + 1}` : `You eliminated Enemy ${index + 1}`, "good");
+          friendlyKillsRef.current += 1;
+          setFriendlyKills(friendlyKillsRef.current);
 
-        // A tied match gone to sudden death ends on the very next kill,
-        // no matter the kill limit — this counts, so it wins outright.
-        if (suddenDeathActiveRef.current) {
-          setMatchEndReason("killLimit");
-          setGameState((gs) => (gs === "playing" ? "won" : gs));
-          return;
+          // A tied match gone to sudden death ends on the very next kill,
+          // no matter the kill limit — this counts, so it wins outright.
+          if (suddenDeathActiveRef.current) {
+            setMatchEndReason("killLimit");
+            setGameState((gs) => (gs === "playing" ? "won" : gs));
+            return;
+          }
+
+          const limit = scoreLimitRef.current;
+          if (limit > 0 && friendlyKillsRef.current >= limit) {
+            setMatchEndReason("killLimit");
+            setGameState((gs) => (gs === "playing" ? "won" : gs));
+            return;
+          }
+        } else {
+          pushKillFeed(`Enemy ${index + 1} was eliminated`, "good");
         }
 
-        const limit = scoreLimitRef.current;
-        if (limit > 0 && friendlyKillsRef.current >= limit) {
-          setMatchEndReason("killLimit");
-          setGameState((gs) => (gs === "playing" ? "won" : gs));
-          return;
-        }
-        if (nextArr.every((h) => h <= 0)) {
-          setMatchEndReason("eliminated");
-          setGameState((gs) => (gs === "playing" ? "won" : gs));
-        }
+        // Bring this bot back at a different spawn point instead of ending
+        // the match just because the bots currently on the map are dead —
+        // the match keeps running until the kill limit (or time limit) is
+        // actually reached.
+        scheduleRespawn(
+          index,
+          botHealthsRef,
+          setBotHealths,
+          botSpawnIndicesRef,
+          setBotSpawnIndices,
+          ENEMY_SPAWN_POINTS.length,
+          matchIdRef.current
+        );
       }
     },
-    [pushKillFeed]
+    [pushKillFeed, scheduleRespawn]
   );
 
   // Ally bot (TDM only) took damage from an enemy bot's attack.
@@ -900,10 +1078,23 @@ export default function App() {
         if (limit > 0 && enemyKillsRef.current >= limit) {
           setMatchEndReason("killLimit");
           setGameState((gs) => (gs === "playing" ? "lost" : gs));
+          return;
         }
+
+        // Same respawn treatment as enemy bots, so allies keep fighting
+        // alongside the player instead of staying dead for the rest of TDM.
+        scheduleRespawn(
+          index,
+          allyHealthsRef,
+          setAllyHealths,
+          allySpawnIndicesRef,
+          setAllySpawnIndices,
+          ALLY_SPAWN_POINTS.length,
+          matchIdRef.current
+        );
       }
     },
-    [pushKillFeed]
+    [pushKillFeed, scheduleRespawn]
   );
 
   // Fullscreen: track browser state and expose a toggle for the button + click-to-play.
@@ -942,10 +1133,17 @@ export default function App() {
     duelConnectionRef.current?.sendShot([from.x, from.y, from.z], [to.x, to.y, to.z]);
   }, []);
 
-  const handleTargetHit = useCallback(() => {
-    setScore((s) => s + 100);
-    setHitmarker(true);
-    setTimeout(() => setHitmarker(false), 120);
+  const handleTargetHit = useCallback((headshot: boolean) => {
+    setScore((s) => s + (headshot ? 200 : 100));
+    if (headshot) {
+      setHeadshotMarker(true);
+      window.setTimeout(() => setHeadshotMarker(false), 220);
+      playHeadshotSound();
+    } else {
+      setHitmarker(true);
+      window.setTimeout(() => setHitmarker(false), 120);
+      playHitSound();
+    }
   }, []);
 
   // isPlayerOne mirror — the DuelConnection callbacks below are created
@@ -996,6 +1194,7 @@ export default function App() {
           new THREE.Vector3(from[0], from[1], from[2]),
           new THREE.Vector3(to[0], to[1], to[2])
         );
+        remotePlayerRef.current?.muzzleFlash();
       },
       onHitResult: (headshot, _damage, killed, yourStats, opponentStats, opponentHealth) => {
         setDuelStats(yourStats);
@@ -1457,9 +1656,6 @@ export default function App() {
                     <span className="text-neutral-500 text-sm font-normal">
                       {scoreLimit > 0 ? `/ ${scoreLimit} kills` : "kills"}
                     </span>
-                  </div>
-                  <div className="text-[11px] text-neutral-400 text-center">
-                    Enemies eliminated: {botHealths.filter((h) => h <= 0).length}/{botHealths.length}
                   </div>
                   <div className="text-[11px] text-neutral-500 mt-1 text-center">{DIFFICULTY_PRESETS[difficulty].label} · Score {score}</div>
                 </div>
@@ -1933,12 +2129,14 @@ export default function App() {
                     key={`enemy-${matchId}-${i}`}
                     id={`enemy-${i}`}
                     team="enemy"
+                    displayName={`Enemy ${i + 1}`}
+                    freeForAll={mode === "ffa"}
                     difficulty={difficulty}
                     active={gameState === "playing" && h > 0}
                     health={h}
                     maxHealth={100}
-                    spawnPosition={ENEMY_SPAWN_POINTS[i % ENEMY_SPAWN_POINTS.length]}
-                    onDamageTaken={(dmg) => handleHitBot(i, dmg)}
+                    spawnPosition={ENEMY_SPAWN_POINTS[botSpawnIndices[i] ?? i % ENEMY_SPAWN_POINTS.length]}
+                    onDamageTaken={(dmg, attackerId, headshot) => handleHitBot(i, dmg, attackerId, headshot)}
                     bulletEffectsRef={bulletEffectsRef}
                     registry={registry}
                   />
@@ -1951,11 +2149,13 @@ export default function App() {
                     key={`ally-${matchId}-${i}`}
                     id={`ally-${i}`}
                     team="friendly"
+                    displayName={`Ally ${i + 1}`}
+                    freeForAll={false}
                     difficulty={difficulty}
                     active={gameState === "playing" && h > 0}
                     health={h}
                     maxHealth={100}
-                    spawnPosition={ALLY_SPAWN_POINTS[i % ALLY_SPAWN_POINTS.length]}
+                    spawnPosition={ALLY_SPAWN_POINTS[allySpawnIndices[i] ?? i % ALLY_SPAWN_POINTS.length]}
                     onDamageTaken={(dmg) => handleHitAlly(i, dmg)}
                     bulletEffectsRef={bulletEffectsRef}
                     registry={registry}

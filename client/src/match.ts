@@ -14,7 +14,7 @@ export function defaultKillLimit(mode: GameMode): number {
   return mode === "tdm" ? 50 : 30;
 }
 
-export type MatchEndReason = "killLimit" | "timeLimit" | "eliminated" | "defeated" | null;
+export type MatchEndReason = "killLimit" | "timeLimit" | null;
 
 export function formatMatchEndReason(reason: MatchEndReason): string {
   switch (reason) {
@@ -22,10 +22,6 @@ export function formatMatchEndReason(reason: MatchEndReason): string {
       return "Kill Limit Reached";
     case "timeLimit":
       return "Time Limit Reached";
-    case "eliminated":
-      return "All Enemies Eliminated";
-    case "defeated":
-      return "You Were Eliminated";
     default:
       return "";
   }
@@ -51,20 +47,28 @@ export interface Combatant {
   team: Team;
   position: THREE.Vector3;
   alive: boolean;
-  damage: (amount: number) => void;
+  // attackerId lets the FFA case (a bot killing another bot) be told apart
+  // from a hit the player actually landed, so only the player's own kills
+  // count toward their score.
+  damage: (amount: number, attackerId?: string) => void;
 }
 
 export type CombatantRegistry = Map<string, Combatant>;
 
 export function findNearestOpponent(
   registry: CombatantRegistry,
+  myId: string,
   myTeam: Team,
-  myPos: THREE.Vector3
+  myPos: THREE.Vector3,
+  // FFA: every other combatant is hostile (bots fight each other, not just
+  // the player). TDM: only the opposing team counts, same as before.
+  freeForAll: boolean
 ): Combatant | null {
   let nearest: Combatant | null = null;
   let nearestDistSq = Infinity;
   registry.forEach((c) => {
-    if (c.team === myTeam || !c.alive) return;
+    if (c.id === myId || !c.alive) return;
+    if (!freeForAll && c.team === myTeam) return;
     const distSq = c.position.distanceToSquared(myPos);
     if (distSq < nearestDistSq) {
       nearestDistSq = distSq;

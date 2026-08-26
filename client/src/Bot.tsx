@@ -1,6 +1,6 @@
 import { useRef, useMemo, useEffect, useCallback } from "react";
 import { useFrame } from "@react-three/fiber";
-import { useGLTF, useAnimations } from "@react-three/drei";
+import { useGLTF, useAnimations, Billboard, Text } from "@react-three/drei";
 import { RigidBody, RapierRigidBody, CapsuleCollider, useRapier } from "@react-three/rapier";
 import * as THREE from "three";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
@@ -35,6 +35,20 @@ const WAYPOINT_RADIUS = 0.5;
 const LOW_HEALTH_FRACTION = 0.3;
 const GRAVITY = -18;
 
+// Headshots are decided against the rig's actual head bone (confirmed via
+// the GLB's node list — this is a Mixamo-style skeleton) rather than a
+// height-fraction guess: a shot counts if the mesh raycast's hit point
+// lands within this radius of the head bone's current (animated) world
+// position. Falls back to a height-fraction heuristic if the bone is ever
+// missing (e.g. a different model gets swapped in later).
+const HEAD_BONE_NAME = "mixamorig:Head_1";
+const HEAD_HIT_RADIUS = TARGET_HEIGHT * 0.15;
+const HEADSHOT_HEIGHT_FRACTION = 0.8;
+const BODY_DAMAGE = 20;
+// Mirrors the server's BASE_DAMAGE * HEADSHOT_MULTIPLIER for duel (see
+// server/src/protocol.ts) so headshots feel consistent across modes.
+const HEADSHOT_DAMAGE = 50;
+
 const TEAM_COLOR: Record<Team, string> = {
   friendly: "#38bdf8",
   enemy: "#ef4444",
@@ -59,12 +73,17 @@ function randomInBounds(min: THREE.Vector2, max: THREE.Vector2, out: THREE.Vecto
 interface BotProps {
   id: string;
   team: Team;
+  // Shown floating above the bot's head instead of a plain team-color ring.
+  displayName: string;
+  // FFA: this bot treats every other combatant (other bots included) as
+  // hostile. TDM: only the opposing team does.
+  freeForAll: boolean;
   difficulty: Difficulty;
   active: boolean;
   health: number;
   maxHealth: number;
   spawnPosition: [number, number, number];
-  onDamageTaken: (damage: number) => void;
+  onDamageTaken: (damage: number, attackerId?: string, headshot?: boolean) => void;
   bulletEffectsRef: React.RefObject<BulletEffectsHandle | null>;
   registry: CombatantRegistry;
 }
@@ -72,6 +91,8 @@ interface BotProps {
 export function Bot({
   id,
   team,
+  displayName,
+  freeForAll,
   difficulty,
   active,
   health,
@@ -85,6 +106,7 @@ export function Bot({
   const rigidBodyRef = useRef<RapierRigidBody>(null);
   const visualRef = useRef<THREE.Group>(null);
   const flashLightRef = useRef<THREE.PointLight>(null);
+  const flashSpriteRef = useRef<THREE.Mesh>(null);
   const cc = useRef<ReturnType<typeof world.createCharacterController> | null>(null);
 
   const preset = DIFFICULTY_PRESETS[difficulty];
@@ -92,6 +114,8 @@ export function Bot({
   const { scene, animations } = useGLTF(ENEMY_URL);
   const clonedScene = useMemo(() => cloneSkeleton(scene) as THREE.Group, [scene]);
   const { actions } = useAnimations(animations, visualRef);
+  const headBone = useMemo(() => clonedScene.getObjectByName(HEAD_BONE_NAME) ?? null, [clonedScene]);
+  const headWorldPos = useRef(new THREE.Vector3());
 
   // Normalize the model's native scale to TARGET_HEIGHT and work out the
   // vertical offset that puts its feet exactly on the capsule's bottom.
@@ -215,6 +239,16 @@ export function Bot({
     yVelocity.current = 0;
     stuckTimer.current = 0;
     lastPos.current.set(spawnPosition[0], spawnPosition[2]);
+    // A revived bot (health back above 0 after a respawn) reaches this
+    // effect too — undo the death-fall lean/sink the useFrame loop applied
+    // (see the `health <= 0` branch below) so it stands upright at its new
+    // spawn point instead of staying tipped over and sunk into the ground.
+    deathTriggered.current = false;
+    deathProgress.current = 0;
+    if (visualRef.current) {
+      visualRef.current.rotation.x = 0;
+      visualRef.current.position.y = modelOffsetY;
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
@@ -251,10 +285,21 @@ export function Bot({
     elapsed.current += delta;
     if (flashTimer.current > 0) {
       flashTimer.current -= delta;
-      if (flashLightRef.current) flashLightRef.current.visible = flashTimer.current > 0;
+      const stillFlashing = flashTimer.current > 0;
+      if (flashLightRef.current) flashLightRef.current.visible = stillFlashing;
+      if (flashSpriteRef.current) {
+        flashSpriteRef.current.visible = stillFlashing;
+        flashSpriteRef.current.rotation.z = Math.random() * Math.PI * 2;
+      }
     }
 
-    const target = findNearestOpponent(registry, team, myPosVec.current.set(myPos.x, myPos.y, myPos.z));
+    const target = findNearestOpponent(
+      registry,
+      id,
+      team,
+      myPosVec.current.set(myPos.x, myPos.y, myPos.z),
+      freeForAll
+    );
     const toTarget = toTargetVec.current;
     if (target) toTarget.set(target.position.x - myPos.x, target.position.z - myPos.z);
     else toTarget.set(0, 0);
@@ -318,8 +363,9 @@ export function Bot({
       if (!lowHealth && elapsed.current >= nextShotTime.current) {
         nextShotTime.current = elapsed.current + preset.fireInterval + Math.random() * preset.fireJitter;
         playEnemyGunshotSound();
-        flashTimer.current = 0.06;
+        flashTimer.current = 0.08;
         if (flashLightRef.current) flashLightRef.current.visible = true;
+        if (flashSpriteRef.current) flashSpriteRef.current.visible = true;
 
         const muzzle = muzzleVec.current.set(myPos.x, myPos.y + TARGET_HEIGHT * 0.75, myPos.z);
         muzzle.add(
@@ -327,7 +373,7 @@ export function Bot({
         );
         const tVec = targetVec.current.copy(target.position);
         if (Math.random() < preset.accuracy) {
-          target.damage(preset.damage);
+          target.damage(preset.damage, id);
           bulletEffectsRef.current?.addShot(muzzle, tVec);
         } else {
           const spread = spreadVec.current.set(
@@ -425,19 +471,49 @@ export function Bot({
       position={spawnPosition}
       enabledRotations={[false, false, false]}
       canSleep={false}
-      userData={{ isTarget: true, isBot: true, onHit: () => onDamageTaken(20) }}
+      userData={{
+        isTarget: true,
+        isBot: true,
+        // The raycast already hit the visible mesh — check whether it
+        // landed near the actual head bone. Returns the verdict so the
+        // shooter's hitmarker/sound can react immediately (see
+        // RaycastShooter in App.tsx).
+        onHit: (hitPoint: THREE.Vector3) => {
+          let headshot: boolean;
+          if (headBone) {
+            const headPos = headBone.getWorldPosition(headWorldPos.current);
+            headshot = hitPoint.distanceTo(headPos) <= HEAD_HIT_RADIUS;
+          } else {
+            const feetY = (rigidBodyRef.current?.translation().y ?? spawnPosition[1]) - TARGET_HEIGHT / 2;
+            headshot = hitPoint.y - feetY >= TARGET_HEIGHT * HEADSHOT_HEIGHT_FRACTION;
+          }
+          onDamageTaken(headshot ? HEADSHOT_DAMAGE : BODY_DAMAGE, undefined, headshot);
+          return headshot;
+        },
+      }}
     >
       <CapsuleCollider args={[capsuleHalfHeight, capsuleRadius]} friction={0} restitution={0} />
       <group ref={visualRef} position={[0, modelOffsetY, 0]}>
         <primitive object={clonedScene} scale={modelScale} />
       </group>
-      {/* Team marker — stays level (not a child of visualRef) so it doesn't
-          spin with the bot's facing direction. Lets the player tell ally
-          from enemy at a glance in TDM. */}
-      <mesh position={[0, TARGET_HEIGHT + 0.16, 0]} renderOrder={998}>
-        <ringGeometry args={[0.05, 0.09, 20]} />
-        <meshBasicMaterial color={TEAM_COLOR[team]} side={THREE.DoubleSide} depthTest={false} transparent opacity={0.9} />
-      </mesh>
+      {/* Name label — a Billboard (not a child of visualRef) so it always
+          faces the camera instead of spinning with the bot's facing
+          direction. Colored by team so it still doubles as the ally/enemy
+          cue the old ring gave in TDM. */}
+      <Billboard position={[0, TARGET_HEIGHT + 0.18, 0]}>
+        <Text
+          fontSize={0.075}
+          color={TEAM_COLOR[team]}
+          anchorX="center"
+          anchorY="bottom"
+          outlineWidth={0.006}
+          outlineColor="#000000"
+          renderOrder={998}
+          material-depthTest={false}
+        >
+          {displayName}
+        </Text>
+      </Billboard>
       <pointLight
         ref={flashLightRef}
         position={[0, TARGET_HEIGHT * 0.75, 0]}
@@ -446,6 +522,15 @@ export function Bot({
         distance={2.5}
         visible={false}
       />
+      {/* Unlit flash quad — the point light alone can wash out against
+          bright/outdoor lighting; this reads regardless of scene lighting
+          since meshBasicMaterial ignores it entirely. */}
+      <Billboard position={[0, TARGET_HEIGHT * 0.75, 0]}>
+        <mesh ref={flashSpriteRef} visible={false} renderOrder={999}>
+          <planeGeometry args={[0.14, 0.14]} />
+          <meshBasicMaterial color="#fff7c2" transparent opacity={0.95} depthTest={false} />
+        </mesh>
+      </Billboard>
     </RigidBody>
   );
 }
