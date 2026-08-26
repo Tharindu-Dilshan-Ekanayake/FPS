@@ -1,6 +1,6 @@
 import { Suspense, useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from "react";
 import { Canvas, useFrame, useThree, useStore } from "@react-three/fiber";
-import { PointerLockControls, Sky } from "@react-three/drei";
+import { PointerLockControls, Sky, Loader } from "@react-three/drei";
 import { EffectComposer, Bloom, Vignette, ChromaticAberration } from "@react-three/postprocessing";
 import { BlendFunction } from "postprocessing";
 import { Physics, RigidBody, RapierRigidBody, CapsuleCollider, useRapier } from "@react-three/rapier";
@@ -1720,6 +1720,31 @@ export default function App() {
           </div>
         )}
 
+        {/* Duel-only: OUR OWN connection dropped mid-match (a flaky network
+            connection, not the opponent leaving — see network.ts's close
+            handler). The server has no way to tell us the match ended
+            because we're the one who lost the socket, so without this the
+            player would just be stuck staring at a frozen scene with a
+            frozen opponent, with no feedback and no way back to the menu. */}
+        {mode === "duel" && gameState === "playing" && duelStatus === "error" && (
+          <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-black/80 backdrop-blur-sm">
+            <div className="bg-neutral-900/95 border border-red-500/50 rounded-2xl px-10 py-8 text-center shadow-2xl max-w-md w-[90vw]">
+              <p className="text-neutral-500 text-[10px] uppercase tracking-[0.2em] mb-1">Connection Lost</p>
+              <p className="font-black text-2xl tracking-wider uppercase mb-3 text-red-500">Disconnected</p>
+              <p className="text-neutral-400 text-xs mb-6">
+                Lost connection to the match server — this can happen on an unstable connection. This match can't continue.
+              </p>
+              <button
+                type="button"
+                onClick={handleBackToMenu}
+                className="w-full bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-bold uppercase tracking-wider text-sm py-3 rounded-xl shadow-lg transition-colors"
+              >
+                Main Menu
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Small in-HUD watermark — non-intrusive brand mark, not shown
             over the menu or round-end screens where the full logo already
             appears. */}
@@ -2060,6 +2085,20 @@ export default function App() {
             <p><span className="text-emerald-400 font-bold">F</span> Inspect Weapon</p>
           </div>
         )}
+
+        {/* On a slow connection the map/character/weapon models (a few MB of
+            GLBs) can take a real, noticeable amount of time to download —
+            without this, that gap is a blank/frozen-looking screen with zero
+            feedback, which reads as "the game is broken," not "it's loading."
+            Tracks every active three.js loader automatically (useGLTF's
+            preloads at menu time, and whatever's still in flight when a
+            match starts), so it shows and hides itself as needed. */}
+        <Loader
+          containerStyles={{ background: "#0a0a0a" }}
+          innerStyles={{ background: "#262626" }}
+          barStyles={{ background: "#10b981" }}
+          dataStyles={{ color: "#d4d4d4", fontFamily: "inherit" }}
+        />
 
         {/* 3D Scene Viewport */}
         <Canvas

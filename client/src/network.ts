@@ -86,7 +86,18 @@ export class DuelConnection {
     });
 
     socket.addEventListener("close", () => {
+      // disconnect() (a deliberate leave) already nulls out this.socket
+      // synchronously before the actual close event arrives, so if it's
+      // still pointing at this exact socket here, nothing intentional
+      // caused this — a flaky connection dropped out from under the
+      // player mid-queue or mid-match. Without surfacing that, they'd be
+      // left staring at a frozen "Searching…"/match screen forever with
+      // no sign anything went wrong or way to retry.
+      const wasIntentional = this.socket !== socket;
       this.socket = null;
+      if (!wasIntentional) {
+        this.callbacks.onStatusChange?.("error");
+      }
     });
 
     socket.addEventListener("error", () => {
