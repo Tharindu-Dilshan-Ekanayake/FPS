@@ -1,4 +1,4 @@
-import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
 import { useGLTF, useAnimations } from "@react-three/drei";
 import * as THREE from "three";
@@ -31,6 +31,16 @@ const RECOIL_PITCH_RECOVERY = 18; // higher = snappier return to aim
 // originates from the actual gun tip instead of an eyeballed camera-space
 // guess.
 const MUZZLE_TIP_LOCAL: [number, number, number] = [-0.12, 1.18, 1.68];
+// The viewmodel copies the camera's full rotation every frame (see the
+// useFrame below), which looks natural for normal aiming but not at
+// extreme pitch — real forearms can't bend a rifle to point straight up
+// while still gripping it normally, so at the camera's full range the
+// arms visibly stretch/distort. Real FPS viewmodels commonly clamp how far
+// the gun's own pitch follows the camera for exactly this reason, even
+// though the camera itself is free to look further. This only kicks in
+// near vertical look angles — ordinary aiming (well within ±65°) is
+// completely unaffected.
+const WEAPON_MAX_PITCH = THREE.MathUtils.degToRad(65);
 
 export interface WeaponProps {
   isMoving?: boolean;
@@ -78,6 +88,15 @@ function WeaponModel({
   const flashTimer = useRef<number | null>(null);
   const lastShotTime = useRef(0);
   const localOffsetRef = useMemo(() => new THREE.Vector3(), []);
+  // Latest isMoving, readable from the mixer's "finished" callback below
+  // without a stale closure (that callback can fire long after the render
+  // that registered it).
+  const isMovingRef = useRef(isMoving);
+  useEffect(() => {
+    isMovingRef.current = isMoving;
+  }, [isMoving]);
+  const pitchClampEulerRef = useRef(new THREE.Euler(0, 0, 0, "YXZ"));
+  const clampedQuatRef = useRef(new THREE.Quaternion());
 
   // Mouse-look sway: nudges the viewmodel opposite the look direction, then
   // eases back to center — reads as weight/inertia on the gun.
@@ -191,6 +210,60 @@ function WeaponModel({
     }
   }, [isMoving, isReloading, actions]);
 
+  // ── One-shot overlay animations (fire/reload/inspect) ───────────────────
+  // Arms_Fire/Arms_fullreload/Arms_notfullreload/Arms_Inspect used to just
+  // call .play() directly, which does NOT stop whatever else the mixer was
+  // already running — Arms_Idle kept looping at full weight underneath,
+  // and Three.js blends simultaneous actions on shared bones rather than
+  // one replacing the other. The result: the one-shot animation was mostly
+  // or entirely cancelled out by the still-active idle loop, i.e. firing
+  // visibly did nothing. playOverlayOnce fades out idle/walk first, then
+  // resumeLocomotion (via a single persistent mixer listener, not a fresh
+  // one per shot — matters at ~9 shots/sec on full auto, see below) brings
+  // the right one back once the one-shot animation actually finishes.
+  const resumeLocomotion = useCallback(() => {
+    if (!actions) return;
+    if (isMovingRef.current) {
+      actions["Arms_Idle"]?.fadeOut(0.15);
+      actions["Arms_Walk"]?.reset().fadeIn(0.15).play();
+    } else {
+      actions["Arms_Walk"]?.fadeOut(0.15);
+      actions["Arms_Idle"]?.reset().fadeIn(0.15).play();
+    }
+  }, [actions]);
+
+  // Tracks whichever overlay action we're currently waiting to finish, so
+  // ONE persistent mixer listener (registered once below, not once per
+  // shot) can tell "this is the one I'm watching" apart from any other
+  // finished event the mixer fires. Re-triggering the same action (rapid
+  // fire) just reassigns this rather than stacking listeners.
+  const activeOverlayRef = useRef<THREE.AnimationAction | null>(null);
+
+  useEffect(() => {
+    if (!actions) return;
+    const firstAction = Object.values(actions).find((a): a is THREE.AnimationAction => !!a);
+    const mixer = firstAction?.getMixer();
+    if (!mixer) return;
+    const onFinished = (event: { action: THREE.AnimationAction }) => {
+      if (activeOverlayRef.current !== event.action) return;
+      activeOverlayRef.current = null;
+      resumeLocomotion();
+    };
+    mixer.addEventListener("finished", onFinished);
+    return () => mixer.removeEventListener("finished", onFinished);
+  }, [actions, resumeLocomotion]);
+
+  const playOverlayOnce = useCallback(
+    (action: THREE.AnimationAction | null | undefined) => {
+      if (!action || !actions) return;
+      actions["Arms_Idle"]?.fadeOut(0.05);
+      actions["Arms_Walk"]?.fadeOut(0.05);
+      action.reset().setLoop(THREE.LoopOnce, 1).play();
+      activeOverlayRef.current = action;
+    },
+    [actions]
+  );
+
   // ── Fire handler ─────────────────────────────────────────────────────────
   const doFire = (now: number) => {
     if (now - lastShotTime.current < 110) return; // ~550 RPM cap
@@ -224,9 +297,7 @@ function WeaponModel({
     flashTimer.current = window.setTimeout(() => setMuzzleFlash(false), 55);
 
     // Fire animation
-    if (actions?.["Arms_Fire"]) {
-      actions["Arms_Fire"].reset().setLoop(THREE.LoopOnce, 1).play();
-    }
+    playOverlayOnce(actions?.["Arms_Fire"]);
 
     // Muzzle world position — read straight off the barrel-tip anchor
     // (same local spot the muzzle-flash visual renders at) so the
@@ -247,14 +318,14 @@ function WeaponModel({
     playReloadSound();
 
     const clip = actions?.["Arms_fullreload"] ?? actions?.["Arms_notfullreload"];
-    if (clip) {
-      clip.reset().setLoop(THREE.LoopOnce, 1).play();
-    }
+    // Resuming idle/walk once this finishes is handled by the same
+    // finished-listener playOverlayOnce hooks into — no need to also
+    // force it back here, and doing both risked a redundant double-play.
+    playOverlayOnce(clip);
 
     window.setTimeout(() => {
       setAmmo(30);
       setIsReloading(false);
-      actions?.["Arms_Idle"]?.reset().fadeIn(0.01).play();
     }, 2200);
   };
 
@@ -266,7 +337,7 @@ function WeaponModel({
     const onKey = (e: KeyboardEvent) => {
       if (e.code === "KeyR") doReload();
       if (e.code === "KeyF" && !isReloading) {
-        actions?.["Arms_Inspect"]?.reset().setLoop(THREE.LoopOnce, 1).play();
+        playOverlayOnce(actions?.["Arms_Inspect"]);
       }
     };
     window.addEventListener("mousedown", onMouse);
@@ -325,7 +396,15 @@ function WeaponModel({
     const idleY = Math.sin(state.clock.elapsedTime * 0.65) * IDLE_SWAY_AMOUNT_Y * idleFade;
 
     group.position.copy(state.camera.position);
-    group.quaternion.copy(state.camera.quaternion);
+
+    // Clamp how far the viewmodel's own pitch follows the camera (see
+    // WEAPON_MAX_PITCH) — yaw and roll pass through unchanged, only the
+    // up/down look angle is limited, so ordinary aiming is unaffected and
+    // this only softens extreme up/down looks.
+    pitchClampEulerRef.current.setFromQuaternion(state.camera.quaternion, "YXZ");
+    pitchClampEulerRef.current.x = THREE.MathUtils.clamp(pitchClampEulerRef.current.x, -WEAPON_MAX_PITCH, WEAPON_MAX_PITCH);
+    clampedQuatRef.current.setFromEuler(pitchClampEulerRef.current);
+    group.quaternion.copy(clampedQuatRef.current);
 
     // Centered, sights-aligned stance (matches the weapon asset's own
     // reference pose) rather than an off-axis hip-fire corner position.
@@ -338,7 +417,7 @@ function WeaponModel({
       0.015 + sx * 0.6 + bobX + idleX,
       -0.36 - r * 0.02 + sy * 0.6 - bobY + idleY,
       -0.85 + r * 0.06,
-    ).applyQuaternion(state.camera.quaternion));
+    ).applyQuaternion(clampedQuatRef.current));
     group.rotateY(Math.PI + sx * 0.35 + bobX * 0.4);
 
     // Recoil tilt on the group
